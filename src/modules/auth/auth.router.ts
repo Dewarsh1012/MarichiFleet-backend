@@ -1,5 +1,6 @@
 import { Router, Response } from 'express';
 import jwt from 'jsonwebtoken';
+import mongoose from 'mongoose';
 import { z } from 'zod';
 import { OAuth2Client } from 'google-auth-library';
 import { v4 as uuidv4 } from 'uuid';
@@ -35,32 +36,39 @@ authRouter.post('/login', async (req: AuthenticatedRequest, res: Response, next)
     const role = (demoRole || 'FLEET_OWNER') as UserRole;
     const tenantId = 'tenant_delhi_01';
 
-    // Find or create in MongoDB
-    let user = await UserModel.findOne({ email: email.toLowerCase() });
-    if (!user) {
-      user = await UserModel.create({
-        userId: `usr_${uuidv4().slice(0, 8)}`,
-        email: email.toLowerCase(),
-        name: email.split('@')[0].toUpperCase(),
-        role,
-        tenantId,
-        orgId: 'org_marichi_logistics',
-        branches: ['DL-Okhla', 'MH-Bhiwandi', 'KA-Peenya'],
-        permissions: ['*'],
-        authProvider: 'local',
-      });
+    // Find or create in MongoDB if connected
+    let user: any = null;
+    if (mongoose.connection.readyState === 1) {
+      try {
+        user = await UserModel.findOne({ email: email.toLowerCase() });
+        if (!user) {
+          user = await UserModel.create({
+            userId: `usr_${uuidv4().slice(0, 8)}`,
+            email: email.toLowerCase(),
+            name: email.split('@')[0].toUpperCase(),
+            role,
+            tenantId,
+            orgId: 'org_marichi_logistics',
+            branches: ['DL-Okhla', 'MH-Bhiwandi', 'KA-Peenya'],
+            permissions: ['*'],
+            authProvider: 'local',
+          });
+        }
+      } catch (dbErr) {
+        logger.warn({ err: dbErr, msg: 'MongoDB operation note during login; proceeding with stateless auth token' });
+      }
     }
 
     const payload = {
-      userId: user.userId,
-      email: user.email,
-      name: user.name,
-      avatarUrl: user.avatarUrl,
-      tenantId: user.tenantId,
-      orgId: user.orgId,
-      role: user.role as UserRole,
-      branches: user.branches,
-      permissions: user.permissions,
+      userId: user?.userId || `usr_${uuidv4().slice(0, 8)}`,
+      email: email.toLowerCase(),
+      name: user?.name || email.split('@')[0].toUpperCase(),
+      avatarUrl: user?.avatarUrl,
+      tenantId: user?.tenantId || tenantId,
+      orgId: user?.orgId || 'org_marichi_logistics',
+      role: (user?.role || role) as UserRole,
+      branches: user?.branches || ['DL-Okhla', 'MH-Bhiwandi', 'KA-Peenya'],
+      permissions: user?.permissions || ['*'],
     };
 
     const token = jwt.sign(payload, env.JWT_SECRET, { expiresIn: '7d' });
@@ -103,12 +111,16 @@ authRouter.post('/google', async (req: AuthenticatedRequest, res: Response, next
       } catch (verifyErr) {
         logger.warn({ err: verifyErr, msg: 'Google verifyIdToken note (falling back to credential payload)' });
         // Fallback: decode JWT payload without network if testing in dev
-        const decoded: any = jwt.decode(body.credential);
-        if (decoded && decoded.email) {
-          verifiedEmail = decoded.email;
-          verifiedName = decoded.name || decoded.email.split('@')[0];
-          verifiedAvatar = decoded.picture;
-          verifiedGoogleId = decoded.sub;
+        try {
+          const decoded: any = jwt.decode(body.credential);
+          if (decoded && decoded.email) {
+            verifiedEmail = decoded.email;
+            verifiedName = decoded.name || decoded.email.split('@')[0];
+            verifiedAvatar = decoded.picture;
+            verifiedGoogleId = decoded.sub;
+          }
+        } catch (decodeErr) {
+          logger.warn({ err: decodeErr, msg: 'JWT decode of credential failed' });
         }
       }
     }
@@ -120,43 +132,50 @@ authRouter.post('/google', async (req: AuthenticatedRequest, res: Response, next
     const tenantId = 'tenant_delhi_01';
     const role: UserRole = (body.role as UserRole) || 'FLEET_OWNER';
 
-    // Find or create in MongoDB
-    let user = await UserModel.findOne({ email: verifiedEmail.toLowerCase() });
+    // Find or create in MongoDB if connected
+    let user: any = null;
+    if (mongoose.connection.readyState === 1) {
+      try {
+        user = await UserModel.findOne({ email: verifiedEmail.toLowerCase() });
 
-    if (user) {
-      user.name = verifiedName || user.name;
-      user.avatarUrl = verifiedAvatar || user.avatarUrl;
-      user.googleId = verifiedGoogleId || user.googleId;
-      user.authProvider = 'google';
-      await user.save();
-      logger.info(` Google user logged in: ${user.email} (MongoDB ID: ${user._id})`);
-    } else {
-      user = await UserModel.create({
-        userId: `usr_g_${uuidv4().slice(0, 8)}`,
-        email: verifiedEmail.toLowerCase(),
-        name: verifiedName || verifiedEmail.split('@')[0],
-        avatarUrl: verifiedAvatar,
-        googleId: verifiedGoogleId,
-        authProvider: 'google',
-        role,
-        tenantId,
-        orgId: 'org_marichi_logistics',
-        branches: ['DL-Okhla', 'MH-Bhiwandi', 'KA-Peenya'],
-        permissions: ['*'],
-      });
-      logger.info(` Created new Google user in MongoDB: ${user.email} (ID: ${user.userId})`);
+        if (user) {
+          user.name = verifiedName || user.name;
+          user.avatarUrl = verifiedAvatar || user.avatarUrl;
+          user.googleId = verifiedGoogleId || user.googleId;
+          user.authProvider = 'google';
+          await user.save();
+          logger.info(` Google user logged in: ${user.email} (MongoDB ID: ${user._id})`);
+        } else {
+          user = await UserModel.create({
+            userId: `usr_g_${uuidv4().slice(0, 8)}`,
+            email: verifiedEmail.toLowerCase(),
+            name: verifiedName || verifiedEmail.split('@')[0],
+            avatarUrl: verifiedAvatar,
+            googleId: verifiedGoogleId,
+            authProvider: 'google',
+            role,
+            tenantId,
+            orgId: 'org_marichi_logistics',
+            branches: ['DL-Okhla', 'MH-Bhiwandi', 'KA-Peenya'],
+            permissions: ['*'],
+          });
+          logger.info(` Created new Google user in MongoDB: ${user.email} (ID: ${user.userId})`);
+        }
+      } catch (dbErr) {
+        logger.warn({ err: dbErr, msg: 'MongoDB operation note during Google auth; proceeding with stateless auth token' });
+      }
     }
 
     const authPayload = {
-      userId: user.userId,
-      email: user.email,
-      name: user.name,
-      avatarUrl: user.avatarUrl,
-      tenantId: user.tenantId,
-      orgId: user.orgId,
-      role: user.role as UserRole,
-      branches: user.branches,
-      permissions: user.permissions,
+      userId: user?.userId || `usr_g_${(verifiedGoogleId || uuidv4()).slice(0, 8)}`,
+      email: (user?.email || verifiedEmail).toLowerCase(),
+      name: user?.name || verifiedName || verifiedEmail.split('@')[0],
+      avatarUrl: user?.avatarUrl || verifiedAvatar,
+      tenantId: user?.tenantId || tenantId,
+      orgId: user?.orgId || 'org_marichi_logistics',
+      role: (user?.role || role) as UserRole,
+      branches: user?.branches || ['DL-Okhla', 'MH-Bhiwandi', 'KA-Peenya'],
+      permissions: user?.permissions || ['*'],
       authProvider: 'google',
     };
 
@@ -164,7 +183,7 @@ authRouter.post('/google', async (req: AuthenticatedRequest, res: Response, next
 
     res.json({
       success: true,
-      message: `Signed in successfully with Google as ${user.name}`,
+      message: `Signed in successfully with Google as ${authPayload.name}`,
       data: {
         token,
         user: authPayload,
