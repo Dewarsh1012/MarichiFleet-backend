@@ -115,14 +115,16 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
-// 5. Auth Context & Idempotency
+// 5. Public routes (no auth/tenant required)
+app.use(`${env.API_PREFIX}/auth`, authRouter);
+
+// 6. Auth Context & Idempotency (for protected routes only)
 app.use(authMiddleware);
 app.use(tenantScopeMiddleware);
 app.use(idempotencyMiddleware);
 
-// 6. API Route Modules
+// 7. Protected API Route Modules
 const api = express.Router();
-api.use('/auth', authRouter);
 api.use('/trips', tripsRouter);
 api.use('/bookings', bookingsRouter);
 api.use('/fleet', fleetRouter);
