@@ -7,6 +7,9 @@ let isMongoConnected = false;
 let activeMongoUri = '';
 let mongoServerInstance: any = null;
 
+// Prevent long buffering timeouts when database is not connected
+mongoose.set('bufferCommands', false);
+
 export function sanitizeMongoUri(rawUri: string): string {
   try {
     const protocolMatch = rawUri.match(/^(mongodb(?:\+srv)?:\/\/)(.*)$/);
