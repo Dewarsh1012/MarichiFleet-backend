@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: marichifleet-core-api
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: CORS_ORIGIN
+        value: "*"
+      - key: JWT_SECRET
+        generateValue: true
+      - key: MONGODB_URI
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        value: 116103213980-jbatdnvs5ckpbamneisc4e8g66v0jgba.apps.googleusercontent.com
+      - key: SERVICE_NAME
+        value: core-api
+      - key: API_PREFIX
+        value: /api
