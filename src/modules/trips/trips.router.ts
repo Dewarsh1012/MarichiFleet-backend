@@ -122,3 +122,17 @@ tripsRouter.post('/:tripId/checkpoints', requirePermission('update', 'trips'), a
     res.json({ success: true, data: updated });
   } catch (err) { next(err); }
 });
+
+// Delete trip
+tripsRouter.delete('/:tripId', requirePermission('delete', 'trips'), async (req: AuthenticatedRequest, res: Response, next) => {
+  try {
+    const tenantId = req.auth!.tenantId;
+    const deleted = await TripModel.findOneAndDelete({
+      tenantId,
+      id: req.params.tripId,
+    }).lean();
+    if (!deleted) return next(AppError.notFound('Trip', req.params.tripId));
+    res.json({ success: true, message: `Trip ${req.params.tripId} deleted successfully.` });
+  } catch (err) { next(err); }
+});
+

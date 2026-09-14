@@ -102,6 +102,18 @@ fleetRouter.put('/vehicles/:vehicleId', requirePermission('update', 'vehicles'),
   } catch (err) { next(err); }
 });
 
+fleetRouter.delete('/vehicles/:vehicleId', requirePermission('delete', 'vehicles'), async (req: AuthenticatedRequest, res: Response, next) => {
+  try {
+    const tenantId = req.auth!.tenantId;
+    const deleted = await VehicleModel.findOneAndDelete({
+      tenantId,
+      $or: [{ id: req.params.vehicleId }, { regNumber: req.params.vehicleId }],
+    }).lean();
+    if (!deleted) return next(AppError.notFound('Vehicle', req.params.vehicleId));
+    res.json({ success: true, message: `Vehicle ${req.params.vehicleId} deleted successfully.` });
+  } catch (err) { next(err); }
+});
+
 // ======================== DRIVERS ========================
 
 fleetRouter.get('/drivers', requirePermission('read', 'drivers'), async (req: AuthenticatedRequest, res: Response, next) => {
@@ -165,3 +177,16 @@ fleetRouter.put('/drivers/:driverId', requirePermission('update', 'drivers'), as
     res.json({ success: true, data: updated });
   } catch (err) { next(err); }
 });
+
+fleetRouter.delete('/drivers/:driverId', requirePermission('delete', 'drivers'), async (req: AuthenticatedRequest, res: Response, next) => {
+  try {
+    const tenantId = req.auth!.tenantId;
+    const deleted = await DriverModel.findOneAndDelete({
+      tenantId,
+      id: req.params.driverId,
+    }).lean();
+    if (!deleted) return next(AppError.notFound('Driver', req.params.driverId));
+    res.json({ success: true, message: `Driver ${req.params.driverId} deleted successfully.` });
+  } catch (err) { next(err); }
+});
+

@@ -77,3 +77,16 @@ bookingsRouter.patch('/:bookingId/status', requirePermission('update', 'bookings
     res.json({ success: true, data: updated });
   } catch (err) { next(err); }
 });
+
+bookingsRouter.delete('/:bookingId', requirePermission('delete', 'bookings'), async (req: AuthenticatedRequest, res: Response, next) => {
+  try {
+    const tenantId = req.auth!.tenantId;
+    const deleted = await BookingModel.findOneAndDelete({
+      tenantId,
+      id: req.params.bookingId,
+    }).lean();
+    if (!deleted) return next(new Error('Booking not found'));
+    res.json({ success: true, message: `Booking ${req.params.bookingId} deleted successfully.` });
+  } catch (err) { next(err); }
+});
+
