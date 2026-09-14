@@ -11,7 +11,7 @@ import { logger } from '../../platform/logger.js';
 
 export const authRouter = Router();
 
-const googleClient = new OAuth2Client(env.GOOGLE_CLIENT_ID);
+const googleClient = new OAuth2Client(env.GOOGLE_CLIENT_ID, env.GOOGLE_CLIENT_SECRET);
 
 const loginSchema = z.object({
   email: z.string().email(),

@@ -11,6 +11,7 @@ const envSchema = z.object({
   JWT_SECRET: z.string().default('marichifleet-super-secret-jwt-key-change-in-production'),
   MONGODB_URI: z.string().optional(),
   GOOGLE_CLIENT_ID: z.string().optional(),
+  GOOGLE_CLIENT_SECRET: z.string().optional(),
   SERVICE_NAME: z.string().default('core-api'),
   API_PREFIX: z.string().default('/api'),
 });
