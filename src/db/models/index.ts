@@ -972,3 +972,41 @@ const LiveLocationSchema = new Schema<ILiveLocation>({
 });
 
 export const LiveLocationModel = mongoose.models.LiveLocation || mongoose.model<ILiveLocation>('LiveLocation', LiveLocationSchema);
+
+// --- ROUTE MODEL (Operations Corridor & Pricing) ---
+export interface IRoute {
+  id: string;
+  tenantId: string;
+  name: string;
+  code: string;
+  originCity: string;
+  destinationCity: string;
+  distanceKm: number;
+  estTransitHours: number;
+  defaultRate: number;
+  tollEstimate: number;
+  stops: string[];
+  status: 'active' | 'inactive';
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const RouteSchema = new Schema<IRoute>(
+  {
+    id: { type: String, required: true, unique: true },
+    tenantId: { type: String, required: true, index: true },
+    name: { type: String, required: true },
+    code: { type: String, required: true },
+    originCity: { type: String, required: true },
+    destinationCity: { type: String, required: true },
+    distanceKm: { type: Number, required: true },
+    estTransitHours: { type: Number, default: 12 },
+    defaultRate: { type: Number, default: 30000 },
+    tollEstimate: { type: Number, default: 1500 },
+    stops: [{ type: String }],
+    status: { type: String, enum: ['active', 'inactive'], default: 'active' },
+  },
+  { timestamps: true }
+);
+
+export const RouteModel = mongoose.models.Route || mongoose.model<IRoute>('Route', RouteSchema);

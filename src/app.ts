@@ -32,6 +32,7 @@ import { hrRouter } from './modules/hr/hr.router.js';
 import { geofencesRouter } from './modules/geofences/geofences.router.js';
 import { dashboardRouter } from './modules/dashboard/dashboard.router.js';
 import { analyticsRouter } from './modules/analytics/analytics.router.js';
+import { routesRouter } from './modules/routes/routes.router.js';
 
 export const app = express();
 
@@ -143,6 +144,7 @@ api.use('/hr', hrRouter);
 api.use('/geofences', geofencesRouter);
 api.use('/dashboard', dashboardRouter);
 api.use('/analytics', analyticsRouter);
+api.use('/routes', routesRouter);
 
 app.use(env.API_PREFIX, api);
 
