@@ -12,6 +12,11 @@ import {
   GeofenceModel,
   JobCardModel,
   ComplianceItemModel,
+  RoleModel,
+  ConsignorModel,
+  ConsigneeModel,
+  ConsignmentModel,
+  ConsignmentStatusHistoryModel,
 } from '../models/index.js';
 import { initialSeedData } from './seedData.js';
 import { logger } from '../../platform/logger.js';
@@ -219,17 +224,258 @@ export async function seedMongoDatabase() {
       logger.info('✅ Seeded Job Cards');
     }
 
-    // Seed Compliance Items if empty
-    if (await ComplianceItemModel.countDocuments() === 0) {
-      await ComplianceItemModel.insertMany([
-        { id: 'cmp_01', tenantId: 'tenant_delhi_01', entityType: 'VEHICLE', entityId: 'DL01AA1001', entityLabel: 'DL01AA1001 (Tata Prima)', itemType: 'National Goods Permit', description: 'All India Tourist & Goods Permit renew via Parivahan', dueDate: new Date(Date.now() + 3600000 * 24 * 18), status: 'EXPIRING_SOON', lastChecked: new Date() },
-        { id: 'cmp_02', tenantId: 'tenant_delhi_01', entityType: 'VEHICLE', entityId: 'MH04BC2002', entityLabel: 'MH04BC2002 (BharatBenz)', itemType: 'Insurance (Comprehensive Commercial)', description: 'New India Assurance Policy No. 312019482', dueDate: new Date(Date.now() + 3600000 * 24 * 120), status: 'COMPLIANT', lastChecked: new Date() },
-        { id: 'cmp_03', tenantId: 'tenant_delhi_01', entityType: 'DRIVER', entityId: 'drv_01', entityLabel: 'Ramesh Singh', itemType: 'Heavy Commercial Driving License', description: 'Commercial HMV badge verification on Sarathi portal', dueDate: new Date(Date.now() + 3600000 * 24 * 340), status: 'COMPLIANT', lastChecked: new Date() },
+    // Seed Super Admin if missing
+    const superAdmin = await UserModel.findOne({ email: 'superadmin@marichifleet.com' });
+    if (!superAdmin) {
+      await UserModel.create({
+        userId: 'usr_superadmin',
+        username: 'superadmin',
+        email: 'superadmin@marichifleet.com',
+        name: 'Super Administrator',
+        role: 'SUPER_ADMIN',
+        tenantId: '*',
+        orgId: 'org_marichi_global',
+        branches: ['ALL'],
+        permissions: ['*'],
+        passwordHash: 'Admin@123',
+        mustResetPassword: true,
+        authProvider: 'local',
+        status: 'ACTIVE',
+      });
+      logger.info('✅ Seeded Super Admin user (superadmin / superadmin@marichifleet.com / Admin@123)');
+    }
+
+    // Seed Roles if empty
+    if ((await RoleModel.countDocuments()) === 0) {
+      await RoleModel.insertMany([
+        { id: 'r_superadmin', code: 'SUPER_ADMIN', name: 'Super Administrator', description: 'Complete system, multi-tenant & configuration access', tenantId: '*', permissions: ['*'], isSystem: true, branchRestricted: false },
+        { id: 'r_admin', code: 'ADMIN', name: 'Tenant Administrator', description: 'Tenant configuration, branch management, master registers', tenantId: '*', permissions: ['admin:*', 'users:*', 'branches:*', 'roles:*'], isSystem: true, branchRestricted: false },
+        { id: 'r_bm', code: 'BRANCH_MANAGER', name: 'Branch Manager', description: 'Branch-level operations, dispatch approvals, local finances', tenantId: '*', permissions: ['consignments:*', 'dispatch:*', 'trips:*'], isSystem: true, branchRestricted: true },
+        { id: 'r_ops', code: 'OPERATIONS_MANAGER', name: 'Operations Manager', description: 'Regional dispatch, asset allocation, control tower oversight', tenantId: '*', permissions: ['consignments:*', 'bookings:*', 'trips:*', 'tower:*'], isSystem: true, branchRestricted: false },
+        { id: 'r_bko', code: 'BOOKING_OPERATOR', name: 'Booking Operator', description: 'Freight quotation, customer order intake, consignment drafting', tenantId: '*', permissions: ['bookings:*', 'consignors:*', 'consignees:*', 'consignments:create'], isSystem: true, branchRestricted: false },
+        { id: 'r_disp', code: 'DISPATCHER', name: 'Dispatcher', description: 'Vehicle & driver assignment, dispatch planning, trip creation', tenantId: '*', permissions: ['dispatch:*', 'consignments:assign_asset', 'trips:create'], isSystem: true, branchRestricted: false },
+        { id: 'r_trk', code: 'TRACKING_EXECUTIVE', name: 'Tracking Executive', description: 'Live location monitoring, delay alarms, checkpoint confirmation', tenantId: '*', permissions: ['tower:*', 'consignments:read', 'trips:read'], isSystem: true, branchRestricted: false },
+        { id: 'r_fin', code: 'FINANCE_EXECUTIVE', name: 'Finance Executive', description: 'E-invoicing, receivables, settlement validation, ledger entry', tenantId: '*', permissions: ['invoices:*', 'ledger:*', 'expenses:*', 'finance:*'], isSystem: true, branchRestricted: false },
+        { id: 'r_cs', code: 'CUSTOMER_SUPPORT', name: 'Customer Support', description: 'Shipper tracking support, delay communications, claim assistance', tenantId: '*', permissions: ['consignments:read', 'customers:read', 'comms:*'], isSystem: true, branchRestricted: false },
+        { id: 'r_drv', code: 'DRIVER', name: 'Driver', description: 'Mobile duty execution, live WhatsApp check-in, digital POD upload', tenantId: '*', permissions: ['trips:read', 'pod:upload'], isSystem: true, branchRestricted: false },
+        { id: 'r_csgu', code: 'CONSIGNOR_USER', name: 'Consignor Portal User', description: 'External shipper portal for booking, live shipment track & invoices', tenantId: '*', permissions: ['portals:consignor', 'consignments:read'], isSystem: true, branchRestricted: false },
+        { id: 'r_cneu', code: 'CONSIGNEE_USER', name: 'Consignee Portal User', description: 'External receiver portal for shipment arrival track & POD download', tenantId: '*', permissions: ['portals:consignee', 'consignments:read'], isSystem: true, branchRestricted: false },
+        { id: 'r_cust', code: 'CUSTOMER_USER', name: 'Customer User', description: 'Freight client self-service portal', tenantId: '*', permissions: ['portals:customer'], isSystem: true, branchRestricted: false },
+        { id: 'r_aud', code: 'AUDITOR', name: 'Compliance Auditor', description: 'Read-only access to immutable audit trails, ledger and GST/e-invoices', tenantId: '*', permissions: ['audit:*', 'reports:*', 'ledger:read'], isSystem: true, branchRestricted: false },
       ]);
-      logger.info('✅ Seeded Compliance Items');
+      logger.info('✅ Seeded 14 Dynamic Roles');
+    }
+
+    // Seed Consignors if empty
+    if ((await ConsignorModel.countDocuments()) === 0) {
+      await ConsignorModel.insertMany([
+        {
+          id: 'csg_01',
+          code: 'CSG-0001',
+          tenantId: 'tenant_delhi_01',
+          branchId: 'br_01',
+          companyName: 'Tata AutoComp Systems Ltd',
+          tradeName: 'TACO Logistics',
+          contactPerson: 'Arun Kulkarni',
+          mobile: '+91 98220 12345',
+          email: 'logistics@taco.com',
+          gstNumber: '27AAACT1234F1Z1',
+          panNumber: 'AAACT1234F',
+          addressLine1: 'Plot A-1, Phase II, MIDC Chakan',
+          city: 'Pune',
+          state: 'Maharashtra',
+          country: 'India',
+          postalCode: '410501',
+          industryType: 'Automotive Components',
+          customerCategory: 'KEY_ACCOUNT',
+          creditLimit: 2500000,
+          paymentTerms: 'NET_30',
+          status: 'ACTIVE',
+          iecNumber: '0308012345',
+          eoriNumber: 'GB123456789000',
+          vatNumber: 'GB999999973',
+          exportLicenseNumber: 'EXP-IN-2026-88',
+          countryOfOrigin: 'India',
+        },
+        {
+          id: 'csg_02',
+          code: 'CSG-0002',
+          tenantId: 'tenant_delhi_01',
+          branchId: 'br_01',
+          companyName: 'Sun Pharma Industries Ltd',
+          tradeName: 'Sun Pharma Exports',
+          contactPerson: 'Dr. Alok Verma',
+          mobile: '+91 98110 54321',
+          email: 'supplychain@sunpharma.com',
+          gstNumber: '07AAACS5678K1Z5',
+          panNumber: 'AAACS5678K',
+          addressLine1: 'Industrial Area Phase 1',
+          city: 'New Delhi',
+          state: 'Delhi',
+          country: 'India',
+          postalCode: '110020',
+          industryType: 'Pharmaceuticals',
+          customerCategory: 'ENTERPRISE',
+          creditLimit: 5000000,
+          paymentTerms: 'NET_15',
+          status: 'ACTIVE',
+          iecNumber: '0512098765',
+          countryOfOrigin: 'India',
+        },
+      ]);
+      logger.info('✅ Seeded Consignors');
+    }
+
+    // Seed Consignees if empty
+    if ((await ConsigneeModel.countDocuments()) === 0) {
+      await ConsigneeModel.insertMany([
+        {
+          id: 'cne_01',
+          code: 'CNE-0001',
+          tenantId: 'tenant_delhi_01',
+          branchId: 'br_01',
+          companyName: 'Apex Motor Parts Private Limited',
+          contactPerson: 'Mahesh Solanki',
+          mobile: '+91 98200 98765',
+          email: 'receiving@apexautoparts.in',
+          gstVatNumber: '24AABCA9999P1Z3',
+          address: 'GIDC Industrial Estate, Makarpura',
+          city: 'Vadodara',
+          state: 'Gujarat',
+          country: 'India',
+          postalCode: '390010',
+          status: 'ACTIVE',
+          importerCode: 'IMP-GJ-449',
+          customsRegistrationNumber: 'CRN-2026-091',
+        },
+        {
+          id: 'cne_02',
+          code: 'CNE-0002',
+          tenantId: 'tenant_delhi_01',
+          branchId: 'br_01',
+          companyName: 'Metro Healthcare Distribution Hub',
+          contactPerson: 'Sanjay Nair',
+          mobile: '+91 98450 11223',
+          email: 'warehouse@metrohealth.com',
+          gstVatNumber: '29AABCM1122D1Z9',
+          address: 'Peenya 3rd Phase, Outer Ring Road',
+          city: 'Bengaluru',
+          state: 'Karnataka',
+          country: 'India',
+          postalCode: '560058',
+          status: 'ACTIVE',
+        },
+      ]);
+      logger.info('✅ Seeded Consignees');
+    }
+
+    // Seed Consignments if empty
+    if ((await ConsignmentModel.countDocuments()) === 0) {
+      await ConsignmentModel.insertMany([
+        {
+          id: 'cgn_01',
+          consignmentNo: 'CON-2026-000001',
+          lrNo: 'LR-2026-000001',
+          bookingId: 'BKG-101',
+          consignorId: 'csg_01',
+          consigneeId: 'cne_01',
+          tenantId: 'tenant_delhi_01',
+          branchId: 'br_01',
+          shipmentDate: '2026-09-14',
+          expectedDeliveryDate: '2026-09-16',
+          cargoType: 'AUTOMOTIVE_PARTS',
+          commodity: 'Engine Gearboxes & Transmissions',
+          description: '12 Pallets of precision automotive transmissions',
+          packageCount: 12,
+          packageType: 'PALLETS',
+          weight: 18.5,
+          volume: 32.0,
+          declaredValue: 4500000,
+          routeId: 'rt_del_mum',
+          vehicleId: 'v_01',
+          vehicleRegNumber: 'DL01AA1001',
+          driverId: 'drv_01',
+          driverName: 'Ramesh Singh',
+          driverPhone: '+91 98110 23456',
+          origin: 'Pune (MIDC Chakan)',
+          destination: 'Vadodara (Makarpura)',
+          freightAmount: 65000,
+          loadingCharges: 2500,
+          unloadingCharges: 2500,
+          fuelSurcharge: 4500,
+          insuranceCharges: 1200,
+          detentionCharges: 0,
+          otherCharges: 800,
+          totalAmount: 76500,
+          paymentMode: 'BILLING_PARTY',
+          paymentStatus: 'PAID',
+          currentStatus: 'IN_TRANSIT',
+          currentLocation: {
+            latitude: 21.1702,
+            longitude: 72.8311,
+            address: 'Surat Bypass NH-48',
+            speedKmH: 52,
+            updatedAt: new Date(),
+          },
+          lastUpdate: new Date(),
+          eta: '2026-09-16 14:00',
+          incoterm: 'FOB',
+          containerNo: 'MSKU-829104-2',
+          containerType: '40FT_HQ',
+        },
+        {
+          id: 'cgn_02',
+          consignmentNo: 'CON-2026-000002',
+          lrNo: 'LR-2026-000002',
+          bookingId: 'BKG-102',
+          consignorId: 'csg_02',
+          consigneeId: 'cne_02',
+          tenantId: 'tenant_delhi_01',
+          branchId: 'br_01',
+          shipmentDate: '2026-09-15',
+          expectedDeliveryDate: '2026-09-18',
+          cargoType: 'TEMPERATURE_CONTROLLED',
+          commodity: 'Pharmaceutical Cold Chain Vaccines',
+          description: 'Refrigerated vaccines (2-8 deg C)',
+          packageCount: 450,
+          packageType: 'CORRUGATED_BOXES',
+          weight: 6.2,
+          volume: 14.5,
+          declaredValue: 8500000,
+          vehicleId: 'v_02',
+          vehicleRegNumber: 'MH04BC2002',
+          driverId: 'drv_02',
+          driverName: 'Gurpreet Singh',
+          driverPhone: '+91 98200 67890',
+          origin: 'New Delhi (Okhla)',
+          destination: 'Bengaluru (Peenya)',
+          freightAmount: 95000,
+          loadingCharges: 3000,
+          unloadingCharges: 3000,
+          fuelSurcharge: 6200,
+          insuranceCharges: 4800,
+          detentionCharges: 0,
+          otherCharges: 1500,
+          totalAmount: 113500,
+          paymentMode: 'PREPAID',
+          paymentStatus: 'PAID',
+          currentStatus: 'VEHICLE_ASSIGNED',
+          currentLocation: {
+            latitude: 28.5355,
+            longitude: 77.2732,
+            address: 'Delhi Okhla Loading Bay',
+            speedKmH: 0,
+            updatedAt: new Date(),
+          },
+          lastUpdate: new Date(),
+          eta: '2026-09-18 10:00',
+        },
+      ]);
+      logger.info('✅ Seeded Consignments');
     }
 
   } catch (error) {
     logger.error({ err: error, msg: 'Error seeding MongoDB collections' });
   }
 }
+

@@ -3,7 +3,9 @@ import mongoose, { Schema } from 'mongoose';
 // --- USER MODEL (Google Auth & Role) ---
 export interface IUser {
   userId: string;
+  username?: string;
   email: string;
+  passwordHash?: string;
   name: string;
   avatarUrl?: string;
   googleId?: string;
@@ -13,12 +15,18 @@ export interface IUser {
   orgId: string;
   branches: string[];
   permissions: string[];
+  mustResetPassword?: boolean;
+  consignorId?: string;
+  consigneeId?: string;
+  status: 'ACTIVE' | 'INACTIVE' | 'SUSPENDED';
   createdAt: Date;
 }
 
 const UserSchema = new Schema<IUser>({
   userId: { type: String, required: true, unique: true },
+  username: { type: String, sparse: true, lowercase: true, trim: true },
   email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+  passwordHash: { type: String },
   name: { type: String, required: true },
   avatarUrl: { type: String },
   googleId: { type: String, sparse: true },
@@ -28,6 +36,10 @@ const UserSchema = new Schema<IUser>({
   orgId: { type: String, default: 'org_marichi_logistics' },
   branches: { type: [String], default: ['DL-Okhla', 'MH-Bhiwandi'] },
   permissions: { type: [String], default: ['*'] },
+  mustResetPassword: { type: Boolean, default: false },
+  consignorId: { type: String },
+  consigneeId: { type: String },
+  status: { type: String, enum: ['ACTIVE', 'INACTIVE', 'SUSPENDED'], default: 'ACTIVE' },
   createdAt: { type: Date, default: Date.now },
 });
 
@@ -41,7 +53,10 @@ export interface ITenant {
   pan: string;
   stateCode: string;
   registeredAddress: string;
-  branches: Array<{ code: string; name: string; gstin: string }>;
+  branches: Array<{ code: string; name: string; gstin: string; address?: string; phone?: string; manager?: string }>;
+  modulesEnabled: string[];
+  settings?: Record<string, any>;
+  status: 'ACTIVE' | 'SUSPENDED' | 'TRIAL';
   createdAt: Date;
 }
 
@@ -52,7 +67,36 @@ const TenantSchema = new Schema<ITenant>({
   pan: { type: String },
   stateCode: { type: String },
   registeredAddress: { type: String },
-  branches: [{ code: String, name: String, gstin: String }],
+  branches: [
+    {
+      code: String,
+      name: String,
+      gstin: String,
+      address: String,
+      phone: String,
+      manager: String,
+    },
+  ],
+  modulesEnabled: {
+    type: [String],
+    default: [
+      'consignors',
+      'consignees',
+      'consignments',
+      'trips',
+      'bookings',
+      'fleet',
+      'finance',
+      'ledger',
+      'tower',
+      'pod',
+      'whatsapp',
+      'approvals',
+      'reports',
+    ],
+  },
+  settings: { type: Schema.Types.Mixed, default: {} },
+  status: { type: String, enum: ['ACTIVE', 'SUSPENDED', 'TRIAL'], default: 'ACTIVE' },
   createdAt: { type: Date, default: Date.now },
 });
 
@@ -1010,3 +1054,599 @@ const RouteSchema = new Schema<IRoute>(
 );
 
 export const RouteModel = mongoose.models.Route || mongoose.model<IRoute>('Route', RouteSchema);
+
+// ==========================================
+// --- 1. DYNAMIC RBAC: ROLE MODEL ---
+// ==========================================
+export interface IRole {
+  id: string;
+  code: string;
+  name: string;
+  description: string;
+  tenantId: string; // '*' for system-wide roles, or specific tenantId
+  permissions: string[];
+  isSystem: boolean;
+  branchRestricted: boolean;
+  allowedBranches?: string[];
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const RoleSchema = new Schema<IRole>(
+  {
+    id: { type: String, required: true, unique: true },
+    code: { type: String, required: true, index: true },
+    name: { type: String, required: true },
+    description: { type: String, default: '' },
+    tenantId: { type: String, required: true, default: '*' },
+    permissions: { type: [String], default: [] },
+    isSystem: { type: Boolean, default: false },
+    branchRestricted: { type: Boolean, default: false },
+    allowedBranches: { type: [String], default: [] },
+  },
+  { timestamps: true }
+);
+
+export const RoleModel = mongoose.models.Role || mongoose.model<IRole>('Role', RoleSchema);
+
+// ==========================================
+// --- 2. APPEND-ONLY AUDIT LOG MODEL ---
+// ==========================================
+export interface IAuditLog {
+  id: string;
+  tenantId: string;
+  module: string;
+  resourceId: string;
+  action: string;
+  actor: {
+    userId: string;
+    email: string;
+    name: string;
+    role: string;
+  };
+  details: Record<string, any>;
+  ipAddress: string;
+  timestamp: Date;
+}
+
+const AuditLogSchema = new Schema<IAuditLog>(
+  {
+    id: { type: String, required: true, unique: true },
+    tenantId: { type: String, required: true, index: true },
+    module: { type: String, required: true, index: true },
+    resourceId: { type: String, required: true, index: true },
+    action: { type: String, required: true, index: true },
+    actor: {
+      userId: { type: String, required: true },
+      email: { type: String, required: true },
+      name: { type: String, required: true },
+      role: { type: String, required: true },
+    },
+    details: { type: Schema.Types.Mixed, default: {} },
+    ipAddress: { type: String, default: '127.0.0.1' },
+    timestamp: { type: Date, default: Date.now, index: true },
+  },
+  { timestamps: false }
+);
+
+export const AuditLogModel = mongoose.models.AuditLog || mongoose.model<IAuditLog>('AuditLog', AuditLogSchema);
+
+// ==========================================
+// --- 3. CONSIGNOR BOUNDED CONTEXT ---
+// ==========================================
+export interface IConsignor {
+  id: string;
+  code: string;
+  tenantId: string;
+  branchId: string;
+  companyName: string;
+  tradeName?: string;
+  contactPerson: string;
+  mobile: string;
+  alternateMobile?: string;
+  email: string;
+  gstNumber?: string;
+  panNumber?: string;
+  addressLine1: string;
+  addressLine2?: string;
+  city: string;
+  state: string;
+  country: string;
+  postalCode: string;
+  industryType?: string;
+  customerCategory?: string;
+  creditLimit: number;
+  paymentTerms?: string;
+  status: 'ACTIVE' | 'INACTIVE' | 'BLOCKED';
+  createdBy?: string;
+  // International Fields
+  iecNumber?: string;
+  eoriNumber?: string;
+  vatNumber?: string;
+  exportLicenseNumber?: string;
+  countryOfOrigin?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const ConsignorSchema = new Schema<IConsignor>(
+  {
+    id: { type: String, required: true, unique: true },
+    code: { type: String, required: true, index: true },
+    tenantId: { type: String, required: true, index: true },
+    branchId: { type: String, default: 'br_01', index: true },
+    companyName: { type: String, required: true, index: true },
+    tradeName: { type: String },
+    contactPerson: { type: String, required: true },
+    mobile: { type: String, required: true },
+    alternateMobile: { type: String },
+    email: { type: String, required: true },
+    gstNumber: { type: String },
+    panNumber: { type: String },
+    addressLine1: { type: String, required: true },
+    addressLine2: { type: String },
+    city: { type: String, required: true },
+    state: { type: String, required: true },
+    country: { type: String, default: 'India' },
+    postalCode: { type: String, required: true },
+    industryType: { type: String },
+    customerCategory: { type: String, default: 'STANDARD' },
+    creditLimit: { type: Number, default: 500000 },
+    paymentTerms: { type: String, default: 'NET_30' },
+    status: { type: String, enum: ['ACTIVE', 'INACTIVE', 'BLOCKED'], default: 'ACTIVE' },
+    createdBy: { type: String },
+    iecNumber: { type: String },
+    eoriNumber: { type: String },
+    vatNumber: { type: String },
+    exportLicenseNumber: { type: String },
+    countryOfOrigin: { type: String },
+  },
+  { timestamps: true }
+);
+
+export const ConsignorModel = mongoose.models.Consignor || mongoose.model<IConsignor>('Consignor', ConsignorSchema);
+
+export interface IConsignorContact {
+  id: string;
+  consignorId: string;
+  tenantId: string;
+  name: string;
+  designation?: string;
+  phone: string;
+  email: string;
+  isPrimary: boolean;
+  createdAt: Date;
+}
+
+const ConsignorContactSchema = new Schema<IConsignorContact>(
+  {
+    id: { type: String, required: true, unique: true },
+    consignorId: { type: String, required: true, index: true },
+    tenantId: { type: String, required: true, index: true },
+    name: { type: String, required: true },
+    designation: { type: String },
+    phone: { type: String, required: true },
+    email: { type: String, required: true },
+    isPrimary: { type: Boolean, default: false },
+  },
+  { timestamps: true }
+);
+
+export const ConsignorContactModel =
+  mongoose.models.ConsignorContact || mongoose.model<IConsignorContact>('ConsignorContact', ConsignorContactSchema);
+
+export interface IConsignorDocument {
+  id: string;
+  consignorId: string;
+  tenantId: string;
+  title: string;
+  type: string;
+  fileUrl: string;
+  validUntil?: string;
+  verified: boolean;
+  createdAt: Date;
+}
+
+const ConsignorDocumentSchema = new Schema<IConsignorDocument>(
+  {
+    id: { type: String, required: true, unique: true },
+    consignorId: { type: String, required: true, index: true },
+    tenantId: { type: String, required: true, index: true },
+    title: { type: String, required: true },
+    type: { type: String, required: true },
+    fileUrl: { type: String, required: true },
+    validUntil: { type: String },
+    verified: { type: Boolean, default: true },
+  },
+  { timestamps: true }
+);
+
+export const ConsignorDocumentModel =
+  mongoose.models.ConsignorDocument || mongoose.model<IConsignorDocument>('ConsignorDocument', ConsignorDocumentSchema);
+
+// ==========================================
+// --- 4. CONSIGNEE BOUNDED CONTEXT ---
+// ==========================================
+export interface IConsignee {
+  id: string;
+  code: string;
+  tenantId: string;
+  branchId: string;
+  companyName: string;
+  contactPerson: string;
+  mobile: string;
+  email: string;
+  gstVatNumber?: string;
+  address: string;
+  city: string;
+  state: string;
+  country: string;
+  postalCode: string;
+  status: 'ACTIVE' | 'INACTIVE' | 'BLOCKED';
+  createdBy?: string;
+  // International
+  importerCode?: string;
+  vatNumber?: string;
+  eoriNumber?: string;
+  customsRegistrationNumber?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const ConsigneeSchema = new Schema<IConsignee>(
+  {
+    id: { type: String, required: true, unique: true },
+    code: { type: String, required: true, index: true },
+    tenantId: { type: String, required: true, index: true },
+    branchId: { type: String, default: 'br_01', index: true },
+    companyName: { type: String, required: true, index: true },
+    contactPerson: { type: String, required: true },
+    mobile: { type: String, required: true },
+    email: { type: String, required: true },
+    gstVatNumber: { type: String },
+    address: { type: String, required: true },
+    city: { type: String, required: true },
+    state: { type: String, required: true },
+    country: { type: String, default: 'India' },
+    postalCode: { type: String, required: true },
+    status: { type: String, enum: ['ACTIVE', 'INACTIVE', 'BLOCKED'], default: 'ACTIVE' },
+    createdBy: { type: String },
+    importerCode: { type: String },
+    vatNumber: { type: String },
+    eoriNumber: { type: String },
+    customsRegistrationNumber: { type: String },
+  },
+  { timestamps: true }
+);
+
+export const ConsigneeModel = mongoose.models.Consignee || mongoose.model<IConsignee>('Consignee', ConsigneeSchema);
+
+// ==========================================
+// --- 5. CONSIGNMENT BOUNDED CONTEXT ---
+// ==========================================
+export type ConsignmentStatus =
+  | 'DRAFT'
+  | 'BOOKED'
+  | 'VEHICLE_ASSIGNED'
+  | 'DRIVER_ASSIGNED'
+  | 'PICKED_UP'
+  | 'IN_TRANSIT'
+  | 'AT_HUB'
+  | 'OUT_FOR_DELIVERY'
+  | 'DELIVERED'
+  | 'POD_RECEIVED'
+  | 'CLOSED';
+
+export type PaymentMode = 'PREPAID' | 'TO_PAY' | 'BILLING_PARTY';
+export type PaymentStatus = 'PENDING' | 'PAID' | 'PARTIAL' | 'OVERDUE';
+export type Incoterm = 'FOB' | 'CIF' | 'EXW' | 'DDP' | 'FCA';
+
+export interface IConsignment {
+  id: string;
+  consignmentNo: string; // CON-YYYY-000001
+  lrNo: string; // LR-YYYY-000001
+  bookingId?: string;
+  consignorId: string;
+  consigneeId: string;
+  tenantId: string;
+  branchId: string;
+  shipmentDate: string;
+  expectedDeliveryDate: string;
+
+  // Cargo Information
+  cargoType: string;
+  commodity: string;
+  description: string;
+  packageCount: number;
+  packageType: string;
+  weight: number; // tons or kg
+  volume: number; // cbm
+  declaredValue: number;
+
+  // Transportation
+  routeId?: string;
+  tripId?: string;
+  vehicleId?: string;
+  vehicleRegNumber?: string;
+  driverId?: string;
+  driverName?: string;
+  driverPhone?: string;
+  origin: string;
+  destination: string;
+
+  // Financial Charges
+  freightAmount: number;
+  loadingCharges: number;
+  unloadingCharges: number;
+  fuelSurcharge: number;
+  insuranceCharges: number;
+  detentionCharges: number;
+  otherCharges: number;
+  totalAmount: number;
+
+  // Payment
+  paymentMode: PaymentMode;
+  paymentStatus: PaymentStatus;
+
+  // Live Tracking
+  currentStatus: ConsignmentStatus;
+  currentLocation?: {
+    latitude: number;
+    longitude: number;
+    address: string;
+    speedKmH: number;
+    updatedAt: Date;
+  };
+  lastUpdate?: Date;
+  eta?: string;
+
+  // Delivery & POD
+  deliveryDate?: string;
+  receiverName?: string;
+  receiverMobile?: string;
+  podUrl?: string;
+  deliveryRemarks?: string;
+
+  // International Logistics Support
+  hsCode?: string;
+  incoterm?: Incoterm;
+  countryOfOrigin?: string;
+  countryOfDestination?: string;
+  portOfLoading?: string;
+  portOfDischarge?: string;
+  containerNo?: string;
+  containerType?: string;
+  billOfLadingNo?: string;
+  airwayBillNo?: string;
+  customsStatus?: string;
+
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const ConsignmentSchema = new Schema<IConsignment>(
+  {
+    id: { type: String, required: true, unique: true },
+    consignmentNo: { type: String, required: true, unique: true, index: true },
+    lrNo: { type: String, required: true, unique: true, index: true },
+    bookingId: { type: String, index: true },
+    consignorId: { type: String, required: true, index: true },
+    consigneeId: { type: String, required: true, index: true },
+    tenantId: { type: String, required: true, index: true },
+    branchId: { type: String, default: 'br_01', index: true },
+    shipmentDate: { type: String, required: true },
+    expectedDeliveryDate: { type: String, required: true },
+
+    cargoType: { type: String, default: 'GENERAL_CARGO' },
+    commodity: { type: String, required: true },
+    description: { type: String, default: '' },
+    packageCount: { type: Number, required: true, default: 1 },
+    packageType: { type: String, default: 'BOXES' },
+    weight: { type: Number, required: true, default: 1 },
+    volume: { type: Number, default: 1 },
+    declaredValue: { type: Number, default: 100000 },
+
+    routeId: { type: String },
+    tripId: { type: String },
+    vehicleId: { type: String },
+    vehicleRegNumber: { type: String },
+    driverId: { type: String },
+    driverName: { type: String },
+    driverPhone: { type: String },
+    origin: { type: String, required: true },
+    destination: { type: String, required: true },
+
+    freightAmount: { type: Number, required: true, default: 0 },
+    loadingCharges: { type: Number, default: 0 },
+    unloadingCharges: { type: Number, default: 0 },
+    fuelSurcharge: { type: Number, default: 0 },
+    insuranceCharges: { type: Number, default: 0 },
+    detentionCharges: { type: Number, default: 0 },
+    otherCharges: { type: Number, default: 0 },
+    totalAmount: { type: Number, required: true, default: 0 },
+
+    paymentMode: { type: String, enum: ['PREPAID', 'TO_PAY', 'BILLING_PARTY'], default: 'BILLING_PARTY' },
+    paymentStatus: { type: String, enum: ['PENDING', 'PAID', 'PARTIAL', 'OVERDUE'], default: 'PENDING' },
+
+    currentStatus: {
+      type: String,
+      enum: [
+        'DRAFT',
+        'BOOKED',
+        'VEHICLE_ASSIGNED',
+        'DRIVER_ASSIGNED',
+        'PICKED_UP',
+        'IN_TRANSIT',
+        'AT_HUB',
+        'OUT_FOR_DELIVERY',
+        'DELIVERED',
+        'POD_RECEIVED',
+        'CLOSED',
+      ],
+      default: 'DRAFT',
+      index: true,
+    },
+    currentLocation: {
+      latitude: Number,
+      longitude: Number,
+      address: String,
+      speedKmH: Number,
+      updatedAt: { type: Date, default: Date.now },
+    },
+    lastUpdate: { type: Date, default: Date.now },
+    eta: { type: String },
+
+    deliveryDate: { type: String },
+    receiverName: { type: String },
+    receiverMobile: { type: String },
+    podUrl: { type: String },
+    deliveryRemarks: { type: String },
+
+    hsCode: { type: String },
+    incoterm: { type: String, enum: ['FOB', 'CIF', 'EXW', 'DDP', 'FCA'] },
+    countryOfOrigin: { type: String },
+    countryOfDestination: { type: String },
+    portOfLoading: { type: String },
+    portOfDischarge: { type: String },
+    containerNo: { type: String },
+    containerType: { type: String },
+    billOfLadingNo: { type: String },
+    airwayBillNo: { type: String },
+    customsStatus: { type: String },
+  },
+  { timestamps: true }
+);
+
+export const ConsignmentModel =
+  mongoose.models.Consignment || mongoose.model<IConsignment>('Consignment', ConsignmentSchema);
+
+export interface IConsignmentItem {
+  id: string;
+  consignmentId: string;
+  tenantId: string;
+  description: string;
+  packageType: string;
+  quantity: number;
+  weightKg: number;
+  volumeCbm: number;
+  declaredValue: number;
+}
+
+const ConsignmentItemSchema = new Schema<IConsignmentItem>(
+  {
+    id: { type: String, required: true, unique: true },
+    consignmentId: { type: String, required: true, index: true },
+    tenantId: { type: String, required: true, index: true },
+    description: { type: String, required: true },
+    packageType: { type: String, default: 'BOXES' },
+    quantity: { type: Number, default: 1 },
+    weightKg: { type: Number, default: 0 },
+    volumeCbm: { type: Number, default: 0 },
+    declaredValue: { type: Number, default: 0 },
+  },
+  { timestamps: true }
+);
+
+export const ConsignmentItemModel =
+  mongoose.models.ConsignmentItem || mongoose.model<IConsignmentItem>('ConsignmentItem', ConsignmentItemSchema);
+
+export interface IConsignmentDocument {
+  id: string;
+  consignmentId: string;
+  tenantId: string;
+  docType: string;
+  docNumber?: string;
+  fileUrl: string;
+  remarks?: string;
+  uploadedAt: Date;
+}
+
+const ConsignmentDocumentSchema = new Schema<IConsignmentDocument>(
+  {
+    id: { type: String, required: true, unique: true },
+    consignmentId: { type: String, required: true, index: true },
+    tenantId: { type: String, required: true, index: true },
+    docType: { type: String, required: true },
+    docNumber: { type: String },
+    fileUrl: { type: String, required: true },
+    remarks: { type: String },
+    uploadedAt: { type: Date, default: Date.now },
+  },
+  { timestamps: true }
+);
+
+export const ConsignmentDocumentModel =
+  mongoose.models.ConsignmentDocument || mongoose.model<IConsignmentDocument>('ConsignmentDocument', ConsignmentDocumentSchema);
+
+export interface IConsignmentStatusHistory {
+  id: string;
+  consignmentId: string;
+  tenantId: string;
+  fromStatus: string;
+  toStatus: string;
+  remarks?: string;
+  location?: string;
+  actor: {
+    userId: string;
+    name: string;
+    role: string;
+  };
+  timestamp: Date;
+}
+
+const ConsignmentStatusHistorySchema = new Schema<IConsignmentStatusHistory>(
+  {
+    id: { type: String, required: true, unique: true },
+    consignmentId: { type: String, required: true, index: true },
+    tenantId: { type: String, required: true, index: true },
+    fromStatus: { type: String, required: true },
+    toStatus: { type: String, required: true },
+    remarks: { type: String },
+    location: { type: String },
+    actor: {
+      userId: { type: String, required: true },
+      name: { type: String, required: true },
+      role: { type: String, required: true },
+    },
+    timestamp: { type: Date, default: Date.now, index: true },
+  },
+  { timestamps: false }
+);
+
+export const ConsignmentStatusHistoryModel =
+  mongoose.models.ConsignmentStatusHistory ||
+  mongoose.model<IConsignmentStatusHistory>('ConsignmentStatusHistory', ConsignmentStatusHistorySchema);
+
+// ==========================================
+// --- 6. PLAYBOOK AUTOMATION RUN MODEL ---
+// ==========================================
+export interface IPlaybookRun {
+  id: string;
+  tenantId: string;
+  playbookKey: string;
+  version: number;
+  triggerEvent: string;
+  entityId: string;
+  status: 'SUCCESS' | 'FAILED' | 'SKIPPED';
+  actionsTaken: string[];
+  executedAt: Date;
+}
+
+const PlaybookRunSchema = new Schema<IPlaybookRun>(
+  {
+    id: { type: String, required: true, unique: true },
+    tenantId: { type: String, required: true, index: true },
+    playbookKey: { type: String, required: true, index: true },
+    version: { type: Number, default: 1 },
+    triggerEvent: { type: String, required: true },
+    entityId: { type: String, required: true, index: true },
+    status: { type: String, enum: ['SUCCESS', 'FAILED', 'SKIPPED'], default: 'SUCCESS' },
+    actionsTaken: { type: [String], default: [] },
+    executedAt: { type: Date, default: Date.now },
+  },
+  { timestamps: true }
+);
+
+export const PlaybookRunModel =
+  mongoose.models.PlaybookRun || mongoose.model<IPlaybookRun>('PlaybookRun', PlaybookRunSchema);
+

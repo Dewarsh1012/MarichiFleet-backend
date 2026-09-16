@@ -33,6 +33,16 @@ import { geofencesRouter } from './modules/geofences/geofences.router.js';
 import { dashboardRouter } from './modules/dashboard/dashboard.router.js';
 import { analyticsRouter } from './modules/analytics/analytics.router.js';
 import { routesRouter } from './modules/routes/routes.router.js';
+import { adminRouter } from './modules/admin/admin.router.js';
+import { consignorsRouter } from './modules/consignors/consignors.router.js';
+import { consigneesRouter } from './modules/consignees/consignees.router.js';
+import { consignmentsRouter } from './modules/consignments/consignments.router.js';
+import { portalsRouter } from './modules/portals/portals.router.js';
+import { reportsRouter } from './modules/reports/reports.router.js';
+import { initPlaybookEngine } from './platform/playbooks/playbookEngine.js';
+
+// Initialize Playbook automation listener
+initPlaybookEngine();
 
 export const app = express();
 
@@ -147,6 +157,12 @@ api.use('/geofences', geofencesRouter);
 api.use('/dashboard', dashboardRouter);
 api.use('/analytics', analyticsRouter);
 api.use('/routes', routesRouter);
+api.use('/admin', adminRouter);
+api.use('/consignors', consignorsRouter);
+api.use('/consignees', consigneesRouter);
+api.use('/consignments', consignmentsRouter);
+api.use('/portals', portalsRouter);
+api.use('/reports', reportsRouter);
 
 app.use(env.API_PREFIX, api);
 

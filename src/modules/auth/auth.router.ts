@@ -15,7 +15,7 @@ export const authRouter = Router();
 const googleClient = new OAuth2Client(env.GOOGLE_CLIENT_ID, env.GOOGLE_CLIENT_SECRET);
 
 const loginSchema = z.object({
-  email: z.string().email(),
+  email: z.string().min(1), // can be email or username
   password: z.string().min(1).optional(),
   demoRole: z.string().optional(),
 });
@@ -29,29 +29,51 @@ const googleAuthSchema = z.object({
   role: z.string().optional(),
 });
 
-// 1. Password / Demo Login
+// 1. Password / Demo Login (Supports Super Admin & Standard Users)
 authRouter.post('/login', async (req: AuthenticatedRequest, res: Response, next) => {
   try {
-    const { email, demoRole } = loginSchema.parse(req.body);
+    const { email: identifier, password, demoRole } = loginSchema.parse(req.body);
     const role = (demoRole || 'FLEET_OWNER') as UserRole;
-    const tenantId = 'tenant_delhi_01';
+    const defaultTenantId = 'tenant_delhi_01';
 
-    // Find or create in MongoDB if connected
     let user: any = null;
     if (mongoose.connection.readyState === 1) {
       try {
-        user = await UserModel.findOne({ email: email.toLowerCase() });
-        if (!user) {
+        const cleanId = identifier.toLowerCase().trim();
+        user = await UserModel.findOne({
+          $or: [{ email: cleanId }, { username: cleanId }],
+        });
+
+        // If Super Admin seeded check
+        if (!user && (cleanId === 'superadmin' || cleanId === 'superadmin@marichifleet.com')) {
+          user = await UserModel.create({
+            userId: 'usr_superadmin',
+            username: 'superadmin',
+            email: 'superadmin@marichifleet.com',
+            name: 'Super Administrator',
+            role: 'SUPER_ADMIN',
+            tenantId: '*',
+            orgId: 'org_marichi_global',
+            branches: ['ALL'],
+            permissions: ['*'],
+            passwordHash: 'Admin@123',
+            mustResetPassword: true,
+            authProvider: 'local',
+            status: 'ACTIVE',
+          });
+        } else if (!user) {
           user = await UserModel.create({
             userId: `usr_${uuidv4().slice(0, 8)}`,
-            email: email.toLowerCase(),
-            name: email.split('@')[0].toUpperCase(),
+            email: cleanId.includes('@') ? cleanId : `${cleanId}@marichifleet.com`,
+            username: cleanId.includes('@') ? cleanId.split('@')[0] : cleanId,
+            name: cleanId.split('@')[0].toUpperCase(),
             role,
-            tenantId,
+            tenantId: defaultTenantId,
             orgId: 'org_marichi_logistics',
             branches: ['DL-Okhla', 'MH-Bhiwandi', 'KA-Peenya'],
             permissions: ['*'],
             authProvider: 'local',
+            status: 'ACTIVE',
           });
         }
       } catch (dbErr) {
@@ -59,16 +81,20 @@ authRouter.post('/login', async (req: AuthenticatedRequest, res: Response, next)
       }
     }
 
-    const payload = {
+    const payload: any = {
       userId: user?.userId || `usr_${uuidv4().slice(0, 8)}`,
-      email: email.toLowerCase(),
-      name: user?.name || email.split('@')[0].toUpperCase(),
+      email: user?.email || (identifier.includes('@') ? identifier.toLowerCase() : `${identifier.toLowerCase()}@marichifleet.com`),
+      username: user?.username || identifier.toLowerCase(),
+      name: user?.name || identifier.split('@')[0].toUpperCase(),
       avatarUrl: user?.avatarUrl,
-      tenantId: user?.tenantId || tenantId,
+      tenantId: user?.tenantId || defaultTenantId,
       orgId: user?.orgId || 'org_marichi_logistics',
       role: (user?.role || role) as UserRole,
       branches: user?.branches || ['DL-Okhla', 'MH-Bhiwandi', 'KA-Peenya'],
       permissions: user?.permissions || ['*'],
+      mustResetPassword: user?.mustResetPassword ?? false,
+      consignorId: user?.consignorId,
+      consigneeId: user?.consigneeId,
     };
 
     const token = jwt.sign(payload, env.JWT_SECRET, { expiresIn: '7d' });
@@ -78,8 +104,35 @@ authRouter.post('/login', async (req: AuthenticatedRequest, res: Response, next)
       data: {
         token,
         user: payload,
+        mustResetPassword: payload.mustResetPassword,
       },
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 1.1 Force Password Reset
+authRouter.post('/reset-forced-password', async (req: AuthenticatedRequest, res: Response, next) => {
+  try {
+    const { email, oldPassword, newPassword } = z.object({
+      email: z.string().min(1),
+      oldPassword: z.string().optional(),
+      newPassword: z.string().min(6),
+    }).parse(req.body);
+
+    const clean = email.toLowerCase().trim();
+    const user = await UserModel.findOne({
+      $or: [{ email: clean }, { username: clean }],
+    });
+
+    if (!user) return next(new Error('User not found'));
+
+    user.passwordHash = newPassword;
+    user.mustResetPassword = false;
+    await user.save();
+
+    res.json({ success: true, message: 'Password has been successfully reset. You may now continue.' });
   } catch (err) {
     next(err);
   }
