@@ -13,9 +13,6 @@ import { v4 as uuidv4 } from 'uuid';
 
 export const adminRouter = Router();
 
-// ==========================================
-// 1. TENANT MANAGEMENT (Super Admin Only)
-// ==========================================
 adminRouter.get('/tenants', requirePermission('read', 'tenants'), async (req: AuthenticatedRequest, res: Response, next) => {
   try {
     const tenants = await TenantModel.find().sort({ createdAt: -1 }).lean();

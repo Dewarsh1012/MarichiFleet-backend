@@ -6,8 +6,6 @@ import { seedMongoDatabase } from './seeds/mongoSeeder.js';
 let isMongoConnected = false;
 let activeMongoUri = '';
 let mongoServerInstance: import('mongodb-memory-server').MongoMemoryServer | null = null;
-
-// Prevent long buffering timeouts when database is not connected
 mongoose.set('bufferCommands', false);
 
 export function sanitizeMongoUri(rawUri: string): string {
