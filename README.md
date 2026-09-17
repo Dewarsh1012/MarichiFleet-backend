@@ -133,7 +133,7 @@ docker run -p 4000:4000 \
 
 ---
 
-## 📡 Core API Endpoints
+##  Core API Endpoints
 
 | Method | Endpoint | Description |
 |---|---|---|
