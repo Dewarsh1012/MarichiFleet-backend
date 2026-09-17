@@ -1,5 +1,28 @@
 import mongoose, { Schema } from 'mongoose';
 
+export interface IMoneySnapshot {
+  minorUnits: number;
+  currency: string;
+  baseMinorUnits: number;
+  baseCurrency: string;
+  rate: number;
+  source: string;
+  asOf: Date;
+}
+
+const MoneySnapshotSchema = new Schema<IMoneySnapshot>(
+  {
+    minorUnits: { type: Number, required: true, min: 0 },
+    currency: { type: String, required: true, uppercase: true, minlength: 3, maxlength: 3 },
+    baseMinorUnits: { type: Number, required: true, min: 0 },
+    baseCurrency: { type: String, required: true, uppercase: true, minlength: 3, maxlength: 3 },
+    rate: { type: Number, required: true, min: 0 },
+    source: { type: String, required: true },
+    asOf: { type: Date, required: true },
+  },
+  { _id: false }
+);
+
 // --- USER MODEL (Google Auth & Role) ---
 export interface IUser {
   userId: string;
@@ -223,6 +246,7 @@ export interface ITrip {
   freightAmount: number;
   advancePaid: number;
   detentionAccrued: number;
+  vendorId?: string;
   checkpoints?: Array<{ name: string; timestamp?: Date; status: string }>;
   pod?: {
     signedByName: string;
@@ -252,13 +276,18 @@ const TripSchema = new Schema<ITrip>({
   weightTons: { type: Number, required: true },
   totalDistanceKm: { type: Number, required: true },
   completedDistanceKm: { type: Number, default: 0 },
-  status: { type: String, default: 'DISPATCHED' },
+  status: {
+    type: String,
+    enum: ['PLANNED', 'DISPATCHED', 'IN_TRANSIT', 'DELIVERED', 'COMPLETED', 'CANCELLED'],
+    default: 'DISPATCHED',
+  },
   slaStatus: { type: String, default: 'ON_TIME' },
   eta: { type: Date },
   dispatchedAt: { type: Date },
   freightAmount: { type: Number, required: true },
   advancePaid: { type: Number, default: 0 },
   detentionAccrued: { type: Number, default: 0 },
+  vendorId: { type: String, index: true },
   checkpoints: [{ name: String, timestamp: Date, status: { type: String, default: 'PENDING' } }],
   pod: {
     signedByName: String,
@@ -319,7 +348,9 @@ export interface IInvoice {
   sgstAmount: number;
   igstAmount: number;
   totalAmount: number;
-  status: string;
+  status: 'DRAFT' | 'FINALISED' | 'PARTIALLY_PAID' | 'PAID' | 'VOID';
+  totalMoney?: IMoneySnapshot;
+  paidMinorUnits: number;
   irn?: string;
   qrCodeData?: string;
   issuedDate: Date;
@@ -343,7 +374,13 @@ const InvoiceSchema = new Schema<IInvoice>({
   sgstAmount: { type: Number, default: 0 },
   igstAmount: { type: Number, default: 0 },
   totalAmount: { type: Number, required: true },
-  status: { type: String, default: 'DRAFT' },
+  status: {
+    type: String,
+    enum: ['DRAFT', 'FINALISED', 'PARTIALLY_PAID', 'PAID', 'VOID'],
+    default: 'DRAFT',
+  },
+  totalMoney: { type: MoneySnapshotSchema },
+  paidMinorUnits: { type: Number, default: 0, min: 0 },
   irn: { type: String },
   qrCodeData: { type: String },
   issuedDate: { type: Date, default: Date.now },
@@ -351,6 +388,30 @@ const InvoiceSchema = new Schema<IInvoice>({
   paidAt: { type: Date },
   finalisedAt: { type: Date },
   dsoDays: { type: Number, default: 0 },
+});
+
+const FINAL_INVOICE_IMMUTABLE_FIELDS = [
+  'tripId',
+  'clientName',
+  'clientGstin',
+  'sacCode',
+  'freightAmount',
+  'detentionAmount',
+  'taxableAmount',
+  'cgstAmount',
+  'sgstAmount',
+  'igstAmount',
+  'totalAmount',
+  'totalMoney',
+  'issuedDate',
+] as const;
+
+InvoiceSchema.pre('save', async function () {
+  if (this.isNew) return;
+  const existing: any = await InvoiceModel.findById(this._id).select('status').lean();
+  if (existing?.status !== 'DRAFT' && FINAL_INVOICE_IMMUTABLE_FIELDS.some((field) => this.isModified(field))) {
+    throw new Error('Finalised invoice financial and identity fields are immutable');
+  }
 });
 
 export const InvoiceModel = mongoose.models.Invoice || mongoose.model<IInvoice>('Invoice', InvoiceSchema);
@@ -587,6 +648,15 @@ export interface IWhatsAppMessage {
   content: string;
   type?: string;
   mediaUrl?: string;
+  tripId?: string;
+  direction?: 'inbound' | 'outbound';
+  deliveryStatus?: 'queued' | 'sent' | 'delivered' | 'read' | 'received' | 'failed' | 'deleted' | 'unknown';
+  provider?: 'meta' | 'simulated' | 'unconfigured';
+  externalId?: string;
+  providerError?: unknown;
+  retryable?: boolean;
+  statusUpdatedAt?: Date;
+  providerPayload?: unknown;
   timestamp: Date;
 }
 
@@ -600,8 +670,23 @@ const WhatsAppMessageSchema = new Schema<IWhatsAppMessage>({
   content: { type: String, required: true },
   type: { type: String },
   mediaUrl: { type: String },
+  tripId: { type: String, index: true },
+  direction: { type: String, enum: ['inbound', 'outbound'] },
+  deliveryStatus: {
+    type: String,
+    enum: ['queued', 'sent', 'delivered', 'read', 'received', 'failed', 'deleted', 'unknown'],
+  },
+  provider: { type: String, enum: ['meta', 'simulated', 'unconfigured'] },
+  externalId: { type: String },
+  providerError: { type: Schema.Types.Mixed },
+  retryable: { type: Boolean, default: false },
+  statusUpdatedAt: { type: Date },
+  providerPayload: { type: Schema.Types.Mixed },
   timestamp: { type: Date, default: Date.now },
 });
+
+WhatsAppMessageSchema.index({ externalId: 1 }, { unique: true, sparse: true });
+WhatsAppMessageSchema.index({ tenantId: 1, recipient: 1, timestamp: -1 });
 
 export const WhatsAppMessageModel = mongoose.models.WhatsAppMessage || mongoose.model<IWhatsAppMessage>('WhatsAppMessage', WhatsAppMessageSchema);
 
@@ -697,6 +782,8 @@ const ComplianceItemSchema = new Schema<IComplianceItem>({
   lastChecked: { type: Date },
   createdAt: { type: Date, default: Date.now },
 });
+ComplianceItemSchema.index({ tenantId: 1, status: 1, dueDate: 1 });
+ComplianceItemSchema.index({ tenantId: 1, entityType: 1, entityId: 1 });
 
 export const ComplianceItemModel = mongoose.models.ComplianceItem || mongoose.model<IComplianceItem>('ComplianceItem', ComplianceItemSchema);
 
@@ -921,8 +1008,153 @@ const GeofenceSchema = new Schema<IGeofence>({
   dwellTimeMinutes: { type: Number },
   createdAt: { type: Date, default: Date.now },
 });
+GeofenceSchema.index({ tenantId: 1, isActive: 1, category: 1 });
 
 export const GeofenceModel = mongoose.models.Geofence || mongoose.model<IGeofence>('Geofence', GeofenceSchema);
+
+export interface IGpsPoint {
+  id: string;
+  tenantId: string;
+  tripId: string;
+  vehicleRegNumber: string;
+  latitude: number;
+  longitude: number;
+  speedKmH: number;
+  heading: number;
+  accuracyM?: number;
+  source: string;
+  idempotencyKey: string;
+  recordedAt: Date;
+  receivedAt: Date;
+}
+
+const GpsPointSchema = new Schema<IGpsPoint>(
+  {
+    id: { type: String, required: true, unique: true },
+    tenantId: { type: String, required: true },
+    tripId: { type: String, required: true },
+    vehicleRegNumber: { type: String, required: true },
+    latitude: { type: Number, required: true, min: -90, max: 90 },
+    longitude: { type: Number, required: true, min: -180, max: 180 },
+    speedKmH: { type: Number, required: true, min: 0, default: 0 },
+    heading: { type: Number, required: true, min: 0, max: 360, default: 0 },
+    accuracyM: { type: Number, min: 0 },
+    source: { type: String, required: true, default: 'API' },
+    idempotencyKey: { type: String, required: true },
+    recordedAt: { type: Date, required: true },
+    receivedAt: { type: Date, required: true, default: Date.now },
+  },
+  { versionKey: false }
+);
+GpsPointSchema.index({ tenantId: 1, tripId: 1, recordedAt: -1, id: -1 });
+GpsPointSchema.index({ tenantId: 1, vehicleRegNumber: 1, recordedAt: -1 });
+GpsPointSchema.index({ tenantId: 1, idempotencyKey: 1 }, { unique: true });
+
+export const GpsPointModel = mongoose.models.GpsPoint || mongoose.model<IGpsPoint>('GpsPoint', GpsPointSchema);
+
+export interface IGeofenceState {
+  tenantId: string;
+  tripId: string;
+  vehicleRegNumber: string;
+  geofenceId: string;
+  isInside: boolean;
+  lastPointId: string;
+  lastRecordedAt: Date;
+  updatedAt: Date;
+}
+
+const GeofenceStateSchema = new Schema<IGeofenceState>(
+  {
+    tenantId: { type: String, required: true },
+    tripId: { type: String, required: true },
+    vehicleRegNumber: { type: String, required: true },
+    geofenceId: { type: String, required: true },
+    isInside: { type: Boolean, required: true },
+    lastPointId: { type: String, required: true },
+    lastRecordedAt: { type: Date, required: true },
+  },
+  { timestamps: { createdAt: false, updatedAt: true }, versionKey: false }
+);
+GeofenceStateSchema.index(
+  { tenantId: 1, tripId: 1, vehicleRegNumber: 1, geofenceId: 1 },
+  { unique: true }
+);
+
+export const GeofenceStateModel =
+  mongoose.models.GeofenceState || mongoose.model<IGeofenceState>('GeofenceState', GeofenceStateSchema);
+
+export interface IGeofenceEvent {
+  id: string;
+  tenantId: string;
+  tripId: string;
+  vehicleRegNumber: string;
+  geofenceId: string;
+  geofenceName: string;
+  type: 'ENTER' | 'EXIT';
+  pointId: string;
+  latitude: number;
+  longitude: number;
+  occurredAt: Date;
+  recordedAt: Date;
+}
+
+const GeofenceEventSchema = new Schema<IGeofenceEvent>(
+  {
+    id: { type: String, required: true, unique: true },
+    tenantId: { type: String, required: true },
+    tripId: { type: String, required: true },
+    vehicleRegNumber: { type: String, required: true },
+    geofenceId: { type: String, required: true },
+    geofenceName: { type: String, required: true },
+    type: { type: String, enum: ['ENTER', 'EXIT'], required: true },
+    pointId: { type: String, required: true },
+    latitude: { type: Number, required: true },
+    longitude: { type: Number, required: true },
+    occurredAt: { type: Date, required: true },
+    recordedAt: { type: Date, required: true, default: Date.now },
+  },
+  { versionKey: false }
+);
+GeofenceEventSchema.index({ tenantId: 1, tripId: 1, occurredAt: -1, _id: -1 });
+GeofenceEventSchema.index({ tenantId: 1, geofenceId: 1, occurredAt: -1 });
+GeofenceEventSchema.index(
+  { tenantId: 1, tripId: 1, geofenceId: 1, pointId: 1, type: 1 },
+  { unique: true }
+);
+
+export const GeofenceEventModel =
+  mongoose.models.GeofenceEvent || mongoose.model<IGeofenceEvent>('GeofenceEvent', GeofenceEventSchema);
+
+export interface IPublicTrackingLink {
+  id: string;
+  tenantId: string;
+  tripId: string;
+  tokenHash: string;
+  expiresAt: Date;
+  revokedAt?: Date;
+  createdBy: string;
+  createdAt: Date;
+}
+
+const PublicTrackingLinkSchema = new Schema<IPublicTrackingLink>(
+  {
+    id: { type: String, required: true, unique: true },
+    tenantId: { type: String, required: true },
+    tripId: { type: String, required: true },
+    tokenHash: { type: String, required: true, unique: true },
+    expiresAt: { type: Date, required: true },
+    revokedAt: { type: Date },
+    createdBy: { type: String, required: true },
+    createdAt: { type: Date, required: true, default: Date.now },
+  },
+  { versionKey: false }
+);
+PublicTrackingLinkSchema.index({ tenantId: 1, tripId: 1, createdAt: -1 });
+PublicTrackingLinkSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+
+export const PublicTrackingLinkModel =
+  mongoose.models.PublicTrackingLink ||
+  mongoose.model<IPublicTrackingLink>('PublicTrackingLink', PublicTrackingLinkSchema);
 
 // --- PAYMENT MODEL ---
 export interface IPayment {
@@ -930,6 +1162,8 @@ export interface IPayment {
   tenantId: string;
   invoiceId: string;
   amount: number;
+  money: IMoneySnapshot;
+  idempotencyKey: string;
   mode: 'BANK_TRANSFER' | 'CHEQUE' | 'CASH' | 'UPI' | 'NEFT' | 'RTGS';
   referenceNumber?: string;
   paidBy: string;
@@ -943,6 +1177,8 @@ const PaymentSchema = new Schema<IPayment>({
   tenantId: { type: String, required: true, index: true },
   invoiceId: { type: String, required: true },
   amount: { type: Number, required: true },
+  money: { type: MoneySnapshotSchema, required: true },
+  idempotencyKey: { type: String, required: true },
   mode: { type: String, enum: ['BANK_TRANSFER', 'CHEQUE', 'CASH', 'UPI', 'NEFT', 'RTGS'], default: 'BANK_TRANSFER' },
   referenceNumber: { type: String },
   paidBy: { type: String, default: '' },
@@ -951,7 +1187,107 @@ const PaymentSchema = new Schema<IPayment>({
   createdAt: { type: Date, default: Date.now },
 });
 
+PaymentSchema.index({ tenantId: 1, idempotencyKey: 1 }, { unique: true });
 export const PaymentModel = mongoose.models.Payment || mongoose.model<IPayment>('Payment', PaymentSchema);
+
+export type TripWalletEntryType =
+  | 'FREIGHT'
+  | 'ADVANCE'
+  | 'FUEL'
+  | 'TOLL'
+  | 'EXPENSE'
+  | 'DETENTION'
+  | 'RECOVERY';
+
+export interface ITripWalletEntry {
+  id: string;
+  tenantId: string;
+  tripId: string;
+  type: TripWalletEntryType;
+  direction: 'CREDIT' | 'DEBIT';
+  money: IMoneySnapshot;
+  partyType?: 'DRIVER' | 'VENDOR' | 'CUSTOMER';
+  partyId?: string;
+  referenceType?: string;
+  referenceId?: string;
+  narration: string;
+  occurredAt: Date;
+  createdBy: string;
+  createdAt: Date;
+}
+
+const TripWalletEntrySchema = new Schema<ITripWalletEntry>({
+  id: { type: String, required: true, unique: true },
+  tenantId: { type: String, required: true, index: true },
+  tripId: { type: String, required: true, index: true },
+  type: {
+    type: String,
+    enum: ['FREIGHT', 'ADVANCE', 'FUEL', 'TOLL', 'EXPENSE', 'DETENTION', 'RECOVERY'],
+    required: true,
+  },
+  direction: { type: String, enum: ['CREDIT', 'DEBIT'], required: true },
+  money: { type: MoneySnapshotSchema, required: true },
+  partyType: { type: String, enum: ['DRIVER', 'VENDOR', 'CUSTOMER'] },
+  partyId: { type: String, index: true },
+  referenceType: { type: String },
+  referenceId: { type: String },
+  narration: { type: String, default: '' },
+  occurredAt: { type: Date, default: Date.now },
+  createdBy: { type: String, required: true },
+  createdAt: { type: Date, default: Date.now },
+});
+TripWalletEntrySchema.index({ tenantId: 1, tripId: 1, occurredAt: 1 });
+
+export const TripWalletEntryModel =
+  mongoose.models.TripWalletEntry || mongoose.model<ITripWalletEntry>('TripWalletEntry', TripWalletEntrySchema);
+
+export interface ISettlement {
+  id: string;
+  tenantId: string;
+  tripId: string;
+  partyType: 'DRIVER' | 'VENDOR';
+  partyId: string;
+  status: 'CALCULATED' | 'APPROVED' | 'PAID' | 'DISPUTED';
+  creditsMinorUnits: number;
+  debitsMinorUnits: number;
+  netDirection: 'PAYABLE' | 'RECOVERABLE' | 'SETTLED';
+  netMoney: IMoneySnapshot;
+  entryIds: string[];
+  calculatedAt: Date;
+  approvedAt?: Date;
+  paidAt?: Date;
+  createdBy: string;
+  updatedAt: Date;
+}
+
+const SettlementSchema = new Schema<ISettlement>(
+  {
+    id: { type: String, required: true, unique: true },
+    tenantId: { type: String, required: true, index: true },
+    tripId: { type: String, required: true, index: true },
+    partyType: { type: String, enum: ['DRIVER', 'VENDOR'], required: true },
+    partyId: { type: String, required: true, index: true },
+    status: {
+      type: String,
+      enum: ['CALCULATED', 'APPROVED', 'PAID', 'DISPUTED'],
+      default: 'CALCULATED',
+    },
+    creditsMinorUnits: { type: Number, required: true, min: 0 },
+    debitsMinorUnits: { type: Number, required: true, min: 0 },
+    netDirection: { type: String, enum: ['PAYABLE', 'RECOVERABLE', 'SETTLED'], required: true },
+    netMoney: { type: MoneySnapshotSchema, required: true },
+    entryIds: { type: [String], default: [] },
+    calculatedAt: { type: Date, default: Date.now },
+    approvedAt: { type: Date },
+    paidAt: { type: Date },
+    createdBy: { type: String, required: true },
+  },
+  { timestamps: true }
+);
+SettlementSchema.index({ tenantId: 1, tripId: 1, partyType: 1, partyId: 1 }, { unique: true });
+
+export const SettlementModel =
+  mongoose.models.Settlement || mongoose.model<ISettlement>('Settlement', SettlementSchema);
 
 // --- NOTIFICATION MODEL ---
 export interface INotification {

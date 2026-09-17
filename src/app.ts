@@ -19,7 +19,7 @@ import { ledgerRouter } from './modules/ledger/ledger.router.js';
 import { towerRouter } from './modules/tower/tower.router.js';
 import { approvalsRouter } from './modules/approvals/approvals.router.js';
 import { fuelRouter } from './modules/fuel/fuel.router.js';
-import { whatsappRouter } from './modules/whatsapp/whatsapp.router.js';
+import { whatsappProtectedRouter, whatsappPublicRouter } from './modules/whatsapp/whatsapp.router.js';
 import { customersRouter } from './modules/customers/customers.router.js';
 import { vendorsRouter } from './modules/vendors/vendors.router.js';
 import { documentsRouter } from './modules/documents/documents.router.js';
@@ -40,6 +40,11 @@ import { consignmentsRouter } from './modules/consignments/consignments.router.j
 import { portalsRouter } from './modules/portals/portals.router.js';
 import { reportsRouter } from './modules/reports/reports.router.js';
 import { currencyRouter, getSupportedCurrenciesHandler } from './modules/currency/currency.router.js';
+import { tripWalletRouter } from './modules/trip-wallet/trip-wallet.router.js';
+import { paymentsRouter } from './modules/payments/payments.router.js';
+import { settlementsRouter } from './modules/settlements/settlements.router.js';
+import { trackingRouter, publicTrackingRouter } from './modules/tracking/tracking.router.js';
+import { syncRouter } from './modules/sync/sync.router.js';
 import { initPlaybookEngine } from './platform/playbooks/playbookEngine.js';
 
 // Initialize Playbook automation listener
@@ -58,19 +63,17 @@ app.use(
       if (allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
-      // Automatically permit any Vercel deployment preview or production domain
-      if (origin.endsWith('.vercel.app')) {
-        return callback(null, true);
-      }
-      // Permissive fallback
-      callback(null, true);
+      callback(new Error(`Origin ${origin} is not allowed by CORS`));
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'x-tenant-id', 'Idempotency-Key', 'Accept', 'X-Requested-With'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'Accept', 'X-Requested-With', 'Content-Range'],
     exposedHeaders: ['x-request-id'],
   })
 );
+
+// Meta signs the exact request bytes. This public route must run before JSON parsing and auth.
+app.use(`${env.API_PREFIX}/whatsapp`, whatsappPublicRouter);
 
 // 2. Body Parser
 app.use(express.json({ limit: '2mb' }));
@@ -129,6 +132,7 @@ app.get('/api/health', (_req, res) => {
 // 5. Public routes (no auth/tenant required)
 app.get(`${env.API_PREFIX}/currency/supported`, getSupportedCurrenciesHandler);
 app.use(`${env.API_PREFIX}/auth`, authRouter);
+app.use(`${env.API_PREFIX}/tracking`, publicTrackingRouter);
 
 // 6. Auth Context & Idempotency (for protected routes only)
 app.use(authMiddleware);
@@ -145,7 +149,7 @@ api.use('/ledger', ledgerRouter);
 api.use('/tower', towerRouter);
 api.use('/approvals', approvalsRouter);
 api.use('/fuel', fuelRouter);
-api.use('/whatsapp', whatsappRouter);
+api.use('/whatsapp', whatsappProtectedRouter);
 api.use('/customers', customersRouter);
 api.use('/vendors', vendorsRouter);
 api.use('/documents', documentsRouter);
@@ -166,6 +170,11 @@ api.use('/consignments', consignmentsRouter);
 api.use('/portals', portalsRouter);
 api.use('/reports', reportsRouter);
 api.use('/currency', currencyRouter);
+api.use('/trip-wallet', tripWalletRouter);
+api.use('/payments', paymentsRouter);
+api.use('/settlements', settlementsRouter);
+api.use('/tracking', trackingRouter);
+api.use('/sync', syncRouter);
 
 app.use(env.API_PREFIX, api);
 
