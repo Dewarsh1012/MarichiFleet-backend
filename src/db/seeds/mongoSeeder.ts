@@ -19,16 +19,36 @@ import {
   ConsignmentStatusHistoryModel,
   TenantModel,
   FxRateModel,
+  WhatsAppMessageModel,
 } from '../models/index.js';
 import { initialSeedData } from './seedData.js';
 import { logger } from '../../platform/logger.js';
+import { env } from '../../config/env.js';
 
-export async function seedMongoDatabase() {
-  try {
-    const userCount = await UserModel.countDocuments();
-    if (await TenantModel.countDocuments() === 0) {
-      await TenantModel.insertMany(
-        initialSeedData.tenants.map((t) => ({
+const DEFAULT_FX_RATES: Record<string, number> = {
+  INR: 1,
+  USD: 83.12,
+  ZMW: 3.18,
+  AED: 22.63,
+  SAR: 22.16,
+  EUR: 90.45,
+  GBP: 105.2,
+  KES: 0.64,
+  TZS: 0.032,
+  BHD: 220.5,
+  OMR: 216,
+  QAR: 22.83,
+};
+
+/** Upserts tenants, FX, approvals, WhatsApp, and demo users even when DB is not empty. */
+export async function syncPlatformSeed(options?: { force?: boolean }) {
+  const force = options?.force ?? env.NODE_ENV !== 'production';
+
+  for (const t of initialSeedData.tenants) {
+    await TenantModel.findOneAndUpdate(
+      { id: t.id },
+      {
+        $set: {
           id: t.id,
           name: t.name,
           gstin: t.gstin,
@@ -36,55 +56,150 @@ export async function seedMongoDatabase() {
           stateCode: t.stateCode,
           registeredAddress: t.registeredAddress,
           branches: t.branches ?? [],
-          settings: t.settings ?? { country: 'India', baseCurrency: 'INR', displayCurrencies: ['INR', 'USD'] },
+          settings: t.settings ?? {
+            country: 'India',
+            baseCurrency: 'INR',
+            displayCurrencies: ['INR', 'USD', 'AED', 'ZMW'],
+            autoConvertReports: true,
+          },
           status: 'ACTIVE',
-          createdAt: t.createdAt ? new Date(t.createdAt) : new Date(),
-        })),
-      );
-      logger.info('✅ Seeded tenants with currency settings');
-    }
-
-    if (await FxRateModel.countDocuments() === 0) {
-      await FxRateModel.create({
-        base: 'INR',
-        source: 'seed',
-        rates: {
-          INR: 1,
-          USD: 83.12,
-          ZMW: 3.18,
-          AED: 22.63,
-          SAR: 22.16,
-          EUR: 90.45,
-          GBP: 105.2,
-          KES: 0.64,
-          TZS: 0.032,
-          BHD: 220.5,
-          OMR: 216,
-          QAR: 22.83,
         },
+        $setOnInsert: {
+          createdAt: t.createdAt ? new Date(t.createdAt) : new Date(),
+        },
+      },
+      { upsert: true, new: true },
+    );
+  }
+  logger.info('Synced tenant records with currency settings');
+
+  await FxRateModel.findOneAndUpdate(
+    { base: 'INR' },
+    {
+      $set: {
+        base: 'INR',
+        source: force ? 'seed-sync' : 'seed',
+        rates: DEFAULT_FX_RATES,
         updatedAt: new Date(),
-      });
-      logger.info('✅ Seeded FX rates');
+      },
+    },
+    { upsert: true, new: true },
+  );
+  logger.info('Synced FX rates');
+
+  for (const appr of initialSeedData.approvals) {
+    const setDoc: Record<string, unknown> = {
+      tenantId: appr.tenantId,
+      department: appr.department || 'FINANCE',
+      category: appr.category || 'GENERAL',
+      title: appr.title,
+      requestedBy: appr.requestedBy,
+      driverPhone: appr.driverPhone,
+      vehicleRegNumber: appr.vehicleRegNumber,
+      tripId: appr.tripId,
+      amount: appr.amount,
+      fuelDetails: appr.fuelDetails,
+      reason: appr.reason,
+    };
+
+    if (force || appr.status === 'PENDING') {
+      setDoc.status = appr.status ?? 'PENDING';
+      setDoc.createdAt = appr.createdAt ? new Date(appr.createdAt) : new Date();
     }
 
-    if (userCount === 0) {
-      logger.info('🌱 Empty MongoDB detected. Pre-populating with transport seed dataset...');
+    await ApprovalModel.findOneAndUpdate(
+      { id: appr.id },
+      { $set: setDoc, $setOnInsert: { id: appr.id } },
+      { upsert: true },
+    );
+  }
+  logger.info(`Synced ${initialSeedData.approvals.length} approval records`);
 
-      // 1. Users
-      await UserModel.insertMany(
-        initialSeedData.users.map((u) => ({
-          userId: u.id,
-          email: u.email,
-          name: u.name,
-          role: u.role,
-          tenantId: u.tenantId,
-          branches: u.branches,
-          permissions: ['*'],
-          authProvider: 'local',
-        }))
-      );
+  for (const msg of initialSeedData.whatsappMessages ?? []) {
+    await WhatsAppMessageModel.findOneAndUpdate(
+      { id: msg.id },
+      {
+        $set: {
+          tenantId: msg.tenantId,
+          sender: msg.sender,
+          senderName: msg.senderName,
+          senderPhone: msg.senderPhone,
+          recipient: msg.recipient,
+          content: msg.content,
+          type: msg.type,
+          mediaUrl: msg.mediaUrl,
+          location: msg.location,
+          deliveryStatus: msg.deliveryStatus ?? 'sent',
+          timestamp: msg.timestamp ? new Date(msg.timestamp) : new Date(),
+        },
+        $setOnInsert: { id: msg.id },
+      },
+      { upsert: true },
+    );
+  }
+  logger.info(`Synced ${initialSeedData.whatsappMessages?.length ?? 0} WhatsApp messages`);
 
-      // 2. Vehicles
+  const demoUsers = [
+    ...initialSeedData.users.map((u) => ({
+      userId: u.id,
+      email: u.email,
+      username: u.email.split('@')[0],
+      name: u.name,
+      role: u.role,
+      tenantId: u.tenantId,
+      branches: u.branches,
+      phone: u.phone,
+      passwordHash: 'demo123',
+    })),
+    {
+      userId: 'usr_superadmin',
+      username: 'superadmin',
+      email: 'superadmin@marichifleet.com',
+      name: 'Super Administrator',
+      role: 'SUPER_ADMIN',
+      tenantId: '*',
+      orgId: 'org_marichi_global',
+      branches: ['ALL'],
+      passwordHash: 'Admin@123',
+      mustResetPassword: true,
+    },
+  ];
+
+  for (const u of demoUsers) {
+    const patch: Record<string, unknown> = {
+      userId: u.userId,
+      username: u.username,
+      name: u.name,
+      role: u.role,
+      tenantId: u.tenantId,
+      branches: u.branches,
+      permissions: ['*'],
+      authProvider: 'local',
+      status: 'ACTIVE',
+      passwordHash: u.passwordHash,
+    };
+    if ('mustResetPassword' in u && u.mustResetPassword !== undefined) patch.mustResetPassword = u.mustResetPassword;
+    if ('orgId' in u && u.orgId) patch.orgId = u.orgId;
+    if ('phone' in u && u.phone) patch.phone = u.phone;
+
+    await UserModel.findOneAndUpdate(
+      { email: u.email.toLowerCase() },
+      { $set: patch },
+      { upsert: true },
+    );
+  }
+  logger.info('Synced demo users (password: demo123, superadmin: Admin@123)');
+}
+
+export async function seedMongoDatabase() {
+  try {
+    await syncPlatformSeed();
+
+    const vehicleCount = await VehicleModel.countDocuments();
+    if (vehicleCount === 0) {
+      logger.info('Empty fleet data detected. Pre-populating vehicles, trips, invoices...');
+
+      // Users + approvals already synced in syncPlatformSeed
       await VehicleModel.insertMany(
         initialSeedData.vehicles.map((v) => ({
           id: v.id,
@@ -104,7 +219,7 @@ export async function seedMongoDatabase() {
         }))
       );
 
-      // 3. Drivers
+      // 2. Drivers
       await DriverModel.insertMany(
         initialSeedData.drivers.map((d) => ({
           id: d.id,
@@ -122,7 +237,7 @@ export async function seedMongoDatabase() {
         }))
       );
 
-      // 4. Trips
+      // 3. Trips
       await TripModel.insertMany(
         initialSeedData.trips.map((t) => ({
           id: t.id,
@@ -156,7 +271,7 @@ export async function seedMongoDatabase() {
         }))
       );
 
-      // 5. Bookings
+      // 4. Bookings
       await BookingModel.insertMany(
         initialSeedData.bookings.map((b) => ({
           id: b.id,
@@ -171,7 +286,7 @@ export async function seedMongoDatabase() {
         }))
       );
 
-      // 6. Invoices
+      // 5. Invoices
       await InvoiceModel.insertMany(
         initialSeedData.invoices.map((inv) => ({
           id: inv.id,
@@ -197,26 +312,7 @@ export async function seedMongoDatabase() {
         }))
       );
 
-      // 7. Approvals
-      await ApprovalModel.insertMany(
-        initialSeedData.approvals.map((appr) => ({
-          id: appr.id,
-          tenantId: appr.tenantId,
-          department: appr.department || 'FINANCE',
-          category: appr.category || 'GENERAL',
-          title: appr.title,
-          requestedBy: appr.requestedBy,
-          driverPhone: appr.driverPhone,
-          vehicleRegNumber: appr.vehicleRegNumber,
-          tripId: appr.tripId,
-          amount: appr.amount,
-          fuelDetails: appr.fuelDetails,
-          reason: appr.reason,
-          status: appr.status,
-        }))
-      );
-
-      logger.info('✅ Successfully seeded core MongoDB with initial fleet, trips, invoices, and users.');
+      logger.info('Successfully seeded fleet, trips, and invoices.');
     }
 
     // Seed Customers if empty
@@ -267,7 +363,7 @@ export async function seedMongoDatabase() {
       logger.info('✅ Seeded Job Cards');
     }
 
-    // Seed Super Admin if missing
+    // Super Admin synced in syncPlatformSeed
     const superAdmin = await UserModel.findOne({ email: 'superadmin@marichifleet.com' });
     if (!superAdmin) {
       await UserModel.create({
