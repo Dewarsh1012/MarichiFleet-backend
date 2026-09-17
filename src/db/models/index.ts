@@ -1650,3 +1650,20 @@ const PlaybookRunSchema = new Schema<IPlaybookRun>(
 export const PlaybookRunModel =
   mongoose.models.PlaybookRun || mongoose.model<IPlaybookRun>('PlaybookRun', PlaybookRunSchema);
 
+// --- FX RATE MODEL ---
+export interface IFxRate {
+  base: string;
+  rates: Record<string, number>;
+  source: string;
+  updatedAt: Date;
+}
+
+const FxRateSchema = new Schema<IFxRate>({
+  base: { type: String, required: true, default: 'INR' },
+  rates: { type: Schema.Types.Mixed, required: true },
+  source: { type: String, default: 'default' },
+  updatedAt: { type: Date, default: Date.now },
+});
+
+export const FxRateModel = mongoose.models.FxRate || mongoose.model<IFxRate>('FxRate', FxRateSchema);
+

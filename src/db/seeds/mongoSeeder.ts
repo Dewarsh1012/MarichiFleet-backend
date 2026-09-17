@@ -17,6 +17,8 @@ import {
   ConsigneeModel,
   ConsignmentModel,
   ConsignmentStatusHistoryModel,
+  TenantModel,
+  FxRateModel,
 } from '../models/index.js';
 import { initialSeedData } from './seedData.js';
 import { logger } from '../../platform/logger.js';
@@ -24,6 +26,47 @@ import { logger } from '../../platform/logger.js';
 export async function seedMongoDatabase() {
   try {
     const userCount = await UserModel.countDocuments();
+    if (await TenantModel.countDocuments() === 0) {
+      await TenantModel.insertMany(
+        initialSeedData.tenants.map((t) => ({
+          id: t.id,
+          name: t.name,
+          gstin: t.gstin,
+          pan: t.pan,
+          stateCode: t.stateCode,
+          registeredAddress: t.registeredAddress,
+          branches: t.branches ?? [],
+          settings: t.settings ?? { country: 'India', baseCurrency: 'INR', displayCurrencies: ['INR', 'USD'] },
+          status: 'ACTIVE',
+          createdAt: t.createdAt ? new Date(t.createdAt) : new Date(),
+        })),
+      );
+      logger.info('✅ Seeded tenants with currency settings');
+    }
+
+    if (await FxRateModel.countDocuments() === 0) {
+      await FxRateModel.create({
+        base: 'INR',
+        source: 'seed',
+        rates: {
+          INR: 1,
+          USD: 83.12,
+          ZMW: 3.18,
+          AED: 22.63,
+          SAR: 22.16,
+          EUR: 90.45,
+          GBP: 105.2,
+          KES: 0.64,
+          TZS: 0.032,
+          BHD: 220.5,
+          OMR: 216,
+          QAR: 22.83,
+        },
+        updatedAt: new Date(),
+      });
+      logger.info('✅ Seeded FX rates');
+    }
+
     if (userCount === 0) {
       logger.info('🌱 Empty MongoDB detected. Pre-populating with transport seed dataset...');
 

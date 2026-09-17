@@ -14,6 +14,13 @@ const envSchema = z.object({
   GOOGLE_CLIENT_SECRET: z.string().optional(),
   SERVICE_NAME: z.string().default('core-api'),
   API_PREFIX: z.string().default('/api'),
+  DEMO_MODE: z
+    .string()
+    .optional()
+    .transform((v) => v === '1' || v === 'true'),
+  WHATSAPP_ACCESS_TOKEN: z.string().optional(),
+  WHATSAPP_PHONE_NUMBER_ID: z.string().optional(),
+  WHATSAPP_VERIFY_TOKEN: z.string().optional(),
 });
 
 const parsed = envSchema.safeParse(process.env);

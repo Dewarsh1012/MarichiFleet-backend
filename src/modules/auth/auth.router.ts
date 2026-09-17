@@ -7,12 +7,19 @@ import { v4 as uuidv4 } from 'uuid';
 import { env } from '../../config/env.js';
 import { AppError } from '../../platform/errors.js';
 import { AuthenticatedRequest, UserRole } from '../../platform/types.js';
+import { parseAuthToken } from '../../platform/middleware/auth.js';
 import { UserModel } from '../../db/models/index.js';
 import { logger } from '../../platform/logger.js';
 
 export const authRouter = Router();
 
 const googleClient = new OAuth2Client(env.GOOGLE_CLIENT_ID, env.GOOGLE_CLIENT_SECRET);
+
+function verifyPassword(stored: string | undefined, provided: string | undefined): boolean {
+  if (!stored) return env.DEMO_MODE || env.NODE_ENV !== 'production';
+  if (!provided) return false;
+  return stored === provided;
+}
 
 const loginSchema = z.object({
   email: z.string().min(1), // can be email or username
@@ -44,6 +51,10 @@ authRouter.post('/login', async (req: AuthenticatedRequest, res: Response, next)
           $or: [{ email: cleanId }, { username: cleanId }],
         });
 
+        if (user && user.passwordHash && !verifyPassword(user.passwordHash, password)) {
+          return next(AppError.unauthorized('Invalid email or password.'));
+        }
+
         // If Super Admin seeded check
         if (!user && (cleanId === 'superadmin' || cleanId === 'superadmin@marichifleet.com')) {
           user = await UserModel.create({
@@ -61,7 +72,7 @@ authRouter.post('/login', async (req: AuthenticatedRequest, res: Response, next)
             authProvider: 'local',
             status: 'ACTIVE',
           });
-        } else if (!user) {
+        } else if (!user && (env.DEMO_MODE || env.NODE_ENV !== 'production')) {
           user = await UserModel.create({
             userId: `usr_${uuidv4().slice(0, 8)}`,
             email: cleanId.includes('@') ? cleanId : `${cleanId}@marichifleet.com`,
@@ -249,22 +260,25 @@ authRouter.post('/google', async (req: AuthenticatedRequest, res: Response, next
 
 // 3. Current User Context
 authRouter.get('/me', async (req: AuthenticatedRequest, res: Response, next) => {
-  if (!req.auth) {
-    return next(AppError.unauthorized());
+  const auth = parseAuthToken(req) ?? req.auth;
+  if (!auth) {
+    return next(AppError.unauthorized('Sign in to load your profile.'));
   }
 
   // Fetch fresh user from MongoDB
   try {
-    const user = await UserModel.findOne({ email: req.auth.email.toLowerCase() });
+    const user = await UserModel.findOne({ email: auth.email.toLowerCase() });
     if (user) {
       return res.json({
         success: true,
         data: {
-          ...req.auth,
+          ...auth,
           name: user.name,
           avatarUrl: user.avatarUrl,
           role: user.role,
           authProvider: user.authProvider,
+          tenantId: user.tenantId,
+          branches: user.branches,
         },
       });
     }
@@ -274,15 +288,18 @@ authRouter.get('/me', async (req: AuthenticatedRequest, res: Response, next) => 
 
   res.json({
     success: true,
-    data: req.auth,
+    data: auth,
   });
 });
 
-// 4. Persona Switcher
+// 4. Persona Switcher (demo / development only)
 authRouter.post('/persona-switch', async (req: AuthenticatedRequest, res: Response, next) => {
+  if (!env.DEMO_MODE && env.NODE_ENV === 'production') {
+    return next(AppError.forbidden('Persona switching is disabled in production.'));
+  }
   try {
     const { role } = z.object({ role: z.string() }).parse(req.body);
-    const tenantId = req.auth?.tenantId || 'tenant_delhi_01';
+    const tenantId = parseAuthToken(req)?.tenantId || req.auth?.tenantId || 'tenant_delhi_01';
 
     const payload = {
       userId: `usr_${role.toLowerCase()}_01`,

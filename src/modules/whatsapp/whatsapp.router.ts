@@ -1,15 +1,19 @@
 import { Router, Response } from 'express';
 import { z } from 'zod';
 import { AuthenticatedRequest } from '../../platform/types.js';
-import { WhatsAppMessageModel, VehicleModel, ExceptionModel } from '../../db/models/index.js';
+import { requirePermission } from '../../platform/middleware/authz.js';
+import { WhatsAppMessageModel, VehicleModel, ExceptionModel, DriverModel } from '../../db/models/index.js';
+import { sendWhatsAppMessage } from '../../platform/whatsapp/whatsappProvider.js';
 import { v4 as uuidv4 } from 'uuid';
 
 export const whatsappRouter = Router();
 
+whatsappRouter.use(requirePermission('read', 'whatsapp'));
+
 // Get conversation messages
 whatsappRouter.get('/messages', async (req: AuthenticatedRequest, res: Response, next) => {
   try {
-    const tenantId = req.auth?.tenantId || 'tenant_delhi_01';
+    const tenantId = req.auth!.tenantId;
     const filter: any = { tenantId };
     if (req.query.phone) {
       const phone = req.query.phone as string;
@@ -20,52 +24,76 @@ whatsappRouter.get('/messages', async (req: AuthenticatedRequest, res: Response,
   } catch (err) { next(err); }
 });
 
-// Send message
+// Send message (Meta Cloud API when configured, otherwise simulated + persisted)
 whatsappRouter.post('/send', async (req: AuthenticatedRequest, res: Response, next) => {
   try {
-    const tenantId = req.auth?.tenantId || 'tenant_delhi_01';
+    const tenantId = req.auth!.tenantId;
     const body = z.object({
-      phone: z.string().default('+91 98110 23456'),
+      phone: z.string().min(8),
       content: z.string().min(1),
       senderName: z.string().optional(),
       mediaUrl: z.string().optional(),
+      tripId: z.string().optional(),
+      purpose: z.string().optional(),
     }).parse(req.body);
+
+    const sendResult = await sendWhatsAppMessage({
+      to: body.phone,
+      body: body.content,
+      tenantId,
+    });
 
     const newMsg = await WhatsAppMessageModel.create({
       id: `msg_${uuidv4().slice(0, 8)}`,
       tenantId,
-      sender: 'DRIVER',
+      sender: 'SYSTEM',
       senderPhone: body.phone,
-      senderName: body.senderName || 'Driver',
-      recipient: 'CONTROL_TOWER',
+      senderName: req.auth!.name,
+      recipient: body.phone,
       content: body.content,
-      type: 'DRIVER_MESSAGE',
+      type: body.purpose ?? 'OUTBOUND',
       mediaUrl: body.mediaUrl,
+      tripId: body.tripId,
+      deliveryStatus: sendResult.ok ? 'sent' : 'failed',
+      provider: sendResult.provider,
+      externalId: sendResult.messageId,
       timestamp: new Date(),
     });
 
-    // Auto-reply simulation
-    const autoReply = await WhatsAppMessageModel.create({
-      id: `msg_${uuidv4().slice(0, 8)}`,
-      tenantId,
-      sender: 'SYSTEM',
-      recipient: body.phone,
-      content: `✅ Message received. Control tower has been notified. Ref: ${newMsg.id}`,
-      type: 'AUTO_REPLY',
-      timestamp: new Date(Date.now() + 2000),
+    res.json({
+      success: true,
+      data: {
+        sent: newMsg,
+        provider: sendResult.provider,
+        externalId: sendResult.messageId,
+        simulated: sendResult.provider === 'simulated',
+      },
     });
-
-    res.json({ success: true, data: { sent: newMsg, autoReply } });
   } catch (err) { next(err); }
 });
 
-// Update live location
+// Inbound webhook stub (Meta Cloud API verification + receive)
+whatsappRouter.get('/webhook', async (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token === process.env.WHATSAPP_VERIFY_TOKEN) {
+    return res.status(200).send(challenge);
+  }
+  return res.sendStatus(403);
+});
+
+whatsappRouter.post('/webhook', async (req: AuthenticatedRequest, res: Response) => {
+  res.sendStatus(200);
+  // Async processing would enqueue here; for now acknowledge immediately per Meta requirements
+});
+
+// Update live location from WhatsApp share
 whatsappRouter.post('/live-location', async (req: AuthenticatedRequest, res: Response, next) => {
   try {
-    const tenantId = req.auth?.tenantId || 'tenant_delhi_01';
-    const { vehicleRegNumber, latitude, longitude, speedKmH } = req.body;
+    const tenantId = req.auth!.tenantId;
+    const { vehicleRegNumber, driverPhone, latitude, longitude, speedKmH } = req.body;
 
-    // Sync to vehicle
     if (vehicleRegNumber) {
       await VehicleModel.findOneAndUpdate(
         { tenantId, regNumber: vehicleRegNumber },
@@ -75,29 +103,48 @@ whatsappRouter.post('/live-location', async (req: AuthenticatedRequest, res: Res
             'currentLocation.longitude': longitude,
             'currentLocation.speedKmH': speedKmH || 0,
             'currentLocation.updatedAt': new Date(),
+            'currentLocation.source': 'whatsapp',
           }
         }
       );
     }
 
-    res.json({ success: true, message: 'Location updated.' });
+    if (driverPhone) {
+      await DriverModel.findOneAndUpdate(
+        { tenantId, phone: driverPhone },
+        { $set: { lastLocationAt: new Date() } },
+      );
+    }
+
+    res.json({ success: true, message: 'Location updated from WhatsApp.' });
   } catch (err) { next(err); }
 });
 
-// Simulate location drop
+// Location drop alert workflow
 whatsappRouter.post('/location-drop', async (req: AuthenticatedRequest, res: Response, next) => {
   try {
-    const tenantId = req.auth?.tenantId || 'tenant_delhi_01';
+    const tenantId = req.auth!.tenantId;
     const { vehicleRegNumber, driverPhone } = req.body;
-    const phone = driverPhone || '+91 98110 23456';
+    const driver = driverPhone
+      ? ((await DriverModel.findOne({ tenantId, phone: driverPhone }).lean()) as { phone?: string } | null)
+      : null;
+    const phone = driverPhone || driver?.phone;
+    if (!phone) {
+      return res.status(400).json({ success: false, error: { message: 'Driver phone required' } });
+    }
+
+    const alertText = `ALERT: Live Location signal drop for ${vehicleRegNumber}. Please open WhatsApp and share Live Location (8 hours) again.`;
+    const sendResult = await sendWhatsAppMessage({ to: phone, body: alertText, tenantId });
 
     await WhatsAppMessageModel.create({
       id: `msg_${uuidv4().slice(0, 8)}`,
       tenantId,
       sender: 'SYSTEM',
       recipient: phone,
-      content: `⚠️ ALERT: Live Location signal drop for ${vehicleRegNumber}. Kripya WhatsApp me jakar "Share Live Location" (8 Hours) dobara share karein.`,
+      content: alertText,
       type: 'LOCATION_DROP_ALERT',
+      deliveryStatus: sendResult.ok ? 'sent' : 'failed',
+      provider: sendResult.provider,
       timestamp: new Date(),
     });
 
@@ -112,6 +159,6 @@ whatsappRouter.post('/location-drop', async (req: AuthenticatedRequest, res: Res
       timestamp: new Date(),
     });
 
-    res.json({ success: true, message: 'Location drop alert sent.' });
+    res.json({ success: true, message: 'Location drop alert sent.', provider: sendResult.provider });
   } catch (err) { next(err); }
 });

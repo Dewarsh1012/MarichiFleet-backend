@@ -39,6 +39,7 @@ import { consigneesRouter } from './modules/consignees/consignees.router.js';
 import { consignmentsRouter } from './modules/consignments/consignments.router.js';
 import { portalsRouter } from './modules/portals/portals.router.js';
 import { reportsRouter } from './modules/reports/reports.router.js';
+import { currencyRouter, getSupportedCurrenciesHandler } from './modules/currency/currency.router.js';
 import { initPlaybookEngine } from './platform/playbooks/playbookEngine.js';
 
 // Initialize Playbook automation listener
@@ -126,6 +127,7 @@ app.get('/api/health', (_req, res) => {
 });
 
 // 5. Public routes (no auth/tenant required)
+app.get(`${env.API_PREFIX}/currency/supported`, getSupportedCurrenciesHandler);
 app.use(`${env.API_PREFIX}/auth`, authRouter);
 
 // 6. Auth Context & Idempotency (for protected routes only)
@@ -163,6 +165,7 @@ api.use('/consignees', consigneesRouter);
 api.use('/consignments', consignmentsRouter);
 api.use('/portals', portalsRouter);
 api.use('/reports', reportsRouter);
+api.use('/currency', currencyRouter);
 
 app.use(env.API_PREFIX, api);
 

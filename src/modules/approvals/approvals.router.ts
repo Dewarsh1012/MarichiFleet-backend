@@ -4,6 +4,7 @@ import { AppError } from '../../platform/errors.js';
 import { AuthenticatedRequest } from '../../platform/types.js';
 import { requirePermission } from '../../platform/middleware/authz.js';
 import { ApprovalModel, VehicleModel, WhatsAppMessageModel } from '../../db/models/index.js';
+import { sendWhatsAppMessage } from '../../platform/whatsapp/whatsappProvider.js';
 import { v4 as uuidv4 } from 'uuid';
 
 export const approvalsRouter = Router();
@@ -71,6 +72,12 @@ approvalsRouter.post('/:approvalId/decide', requirePermission('update', 'approva
         confirmText = `❌ Request '${item.title}' was rejected by ${item.department}. Reason: ${comment || 'Budget restriction'}.`;
       }
 
+      const sendResult = await sendWhatsAppMessage({
+        to: item.driverPhone,
+        body: confirmText,
+        tenantId,
+      });
+
       await WhatsAppMessageModel.create({
         id: `msg_${uuidv4().slice(0, 8)}`,
         tenantId,
@@ -78,6 +85,9 @@ approvalsRouter.post('/:approvalId/decide', requirePermission('update', 'approva
         recipient: item.driverPhone,
         content: confirmText,
         type: 'APPROVAL_CONFIRMATION',
+        deliveryStatus: sendResult.ok ? 'sent' : 'failed',
+        provider: sendResult.provider,
+        externalId: sendResult.messageId,
         timestamp: new Date(),
       });
     }

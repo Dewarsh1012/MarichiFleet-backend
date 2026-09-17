@@ -1,6 +1,7 @@
 import { Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { env } from '../../config/env.js';
+import { AppError } from '../errors.js';
 import { AuthContext, AuthenticatedRequest, UserRole } from '../types.js';
 
 const DEFAULT_DEMO_CONTEXT: AuthContext = {
@@ -14,35 +15,52 @@ const DEFAULT_DEMO_CONTEXT: AuthContext = {
   permissions: ['*'],
 };
 
-export function authMiddleware(req: AuthenticatedRequest, _res: Response, next: NextFunction) {
-  const authHeader = req.headers['authorization'];
-  const demoRoleHeader = req.headers['x-demo-role'] as UserRole | undefined;
-  const tenantIdHeader = req.headers['x-tenant-id'] as string | undefined;
-
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.substring(7);
-    try {
-      const decoded = jwt.verify(token, env.JWT_SECRET) as AuthContext;
-      req.auth = {
-        ...decoded,
-        tenantId: tenantIdHeader || decoded.tenantId || DEFAULT_DEMO_CONTEXT.tenantId,
-      };
-      return next();
-    } catch {
-      // If token invalid, allow demo fallback in development
-      if (env.NODE_ENV === 'production') {
-        return next();
-      }
-    }
-  }
-
-  // Development/demo mode fallback with dynamic persona simulation
-  const role: UserRole = demoRoleHeader || 'FLEET_OWNER';
+function applyDemoContext(req: AuthenticatedRequest, role?: UserRole, tenantId?: string) {
   req.auth = {
     ...DEFAULT_DEMO_CONTEXT,
-    role,
-    tenantId: tenantIdHeader || DEFAULT_DEMO_CONTEXT.tenantId,
+    role: role || 'FLEET_OWNER',
+    tenantId: tenantId || DEFAULT_DEMO_CONTEXT.tenantId,
   };
+}
 
+/** Parse JWT from Authorization header without requiring full middleware chain. */
+export function parseAuthToken(req: AuthenticatedRequest): AuthContext | null {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader?.startsWith('Bearer ')) return null;
+  try {
+    return jwt.verify(authHeader.substring(7), env.JWT_SECRET) as AuthContext;
+  } catch {
+    return null;
+  }
+}
+
+export function authMiddleware(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  const demoRoleHeader = req.headers['x-demo-role'] as UserRole | undefined;
+  const tenantIdHeader = req.headers['x-tenant-id'] as string | undefined;
+  const parsed = parseAuthToken(req);
+
+  if (parsed) {
+    req.auth = {
+      ...parsed,
+      tenantId: tenantIdHeader || parsed.tenantId || DEFAULT_DEMO_CONTEXT.tenantId,
+    };
+    return next();
+  }
+
+  const allowDemo = env.DEMO_MODE || env.NODE_ENV !== 'production';
+  if (allowDemo) {
+    applyDemoContext(req, demoRoleHeader, tenantIdHeader);
+    return next();
+  }
+
+  return next(AppError.unauthorized('Authentication required. Sign in or provide a valid Bearer token.'));
+}
+
+/** Optional auth: attaches user when token present; does not fail when absent. */
+export function optionalAuthMiddleware(req: AuthenticatedRequest, _res: Response, next: NextFunction) {
+  const parsed = parseAuthToken(req);
+  if (parsed) {
+    req.auth = parsed;
+  }
   next();
 }

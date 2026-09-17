@@ -45,7 +45,8 @@ export type Resource =
   | 'audit_logs'
   | 'portals'
   | 'reports'
-  | 'automation';
+  | 'automation'
+  | 'whatsapp';
 
 export function can(ctx: AuthContext, action: Action, resource: Resource): boolean {
   const { role, permissions = [] } = ctx;
