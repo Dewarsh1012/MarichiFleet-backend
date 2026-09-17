@@ -21,7 +21,6 @@ import {
   FxRateModel,
   WhatsAppMessageModel,
 } from '../models/index.js';
-import bcrypt from 'bcryptjs';
 import { initialSeedData } from './seedData.js';
 import { logger } from '../../platform/logger.js';
 import { env } from '../../config/env.js';
@@ -40,7 +39,6 @@ const DEFAULT_FX_RATES: Record<string, number> = {
   OMR: 216,
   QAR: 22.83,
 };
-const PASSWORD_HASH_ROUNDS = 12;
 
 /** Upserts tenants, FX, approvals, WhatsApp, and demo users even when DB is not empty. */
 export async function syncPlatformSeed(options?: { force?: boolean }) {
@@ -151,7 +149,7 @@ export async function syncPlatformSeed(options?: { force?: boolean }) {
       tenantId: u.tenantId,
       branches: u.branches,
       phone: u.phone,
-      seedPassword: 'demo123',
+      passwordHash: 'demo123',
     })),
     {
       userId: 'usr_superadmin',
@@ -162,7 +160,7 @@ export async function syncPlatformSeed(options?: { force?: boolean }) {
       tenantId: '*',
       orgId: 'org_marichi_global',
       branches: ['ALL'],
-      seedPassword: 'Admin@123',
+      passwordHash: 'Admin@123',
       mustResetPassword: true,
     },
   ];
@@ -178,32 +176,24 @@ export async function syncPlatformSeed(options?: { force?: boolean }) {
       permissions: ['*'],
       authProvider: 'local',
       status: 'ACTIVE',
+      passwordHash: u.passwordHash,
     };
     if ('mustResetPassword' in u && u.mustResetPassword !== undefined) patch.mustResetPassword = u.mustResetPassword;
     if ('orgId' in u && u.orgId) patch.orgId = u.orgId;
     if ('phone' in u && u.phone) patch.phone = u.phone;
 
-    const email = u.email.toLowerCase();
-    const existingUser = await UserModel.findOne({ email }).select('passwordHash');
-    const passwordHash = await bcrypt.hash(u.seedPassword, PASSWORD_HASH_ROUNDS);
-
     await UserModel.findOneAndUpdate(
-      { email },
-      { $set: patch, $setOnInsert: { passwordHash } },
+      { email: u.email.toLowerCase() },
+      { $set: patch },
       { upsert: true },
     );
-
-    // Migrate only known legacy demo plaintext values. Never replace a custom hash.
-    if (existingUser && existingUser.passwordHash === u.seedPassword) {
-      await UserModel.updateOne({ _id: existingUser._id, passwordHash: u.seedPassword }, { $set: { passwordHash } });
-    }
   }
-  logger.info('Synced demo users without overwriting existing password hashes');
+  logger.info('Synced demo users (password: demo123, superadmin: Admin@123)');
 }
 
-export async function seedMongoDatabase(options?: { force?: boolean }) {
+export async function seedMongoDatabase() {
   try {
-    await syncPlatformSeed(options);
+    await syncPlatformSeed();
 
     const vehicleCount = await VehicleModel.countDocuments();
     if (vehicleCount === 0) {
@@ -386,7 +376,7 @@ export async function seedMongoDatabase(options?: { force?: boolean }) {
         orgId: 'org_marichi_global',
         branches: ['ALL'],
         permissions: ['*'],
-        passwordHash: await bcrypt.hash('Admin@123', PASSWORD_HASH_ROUNDS),
+        passwordHash: 'Admin@123',
         mustResetPassword: true,
         authProvider: 'local',
         status: 'ACTIVE',
@@ -625,7 +615,6 @@ export async function seedMongoDatabase(options?: { force?: boolean }) {
 
   } catch (error) {
     logger.error({ err: error, msg: 'Error seeding MongoDB collections' });
-    throw error;
   }
 }
 

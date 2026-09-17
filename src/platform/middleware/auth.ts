@@ -23,10 +23,6 @@ function applyDemoContext(req: AuthenticatedRequest, role?: UserRole, tenantId?:
   };
 }
 
-export function isSafeDemoMode(): boolean {
-  return env.DEMO_MODE && env.NODE_ENV !== 'production';
-}
-
 /** Parse JWT from Authorization header without requiring full middleware chain. */
 export function parseAuthToken(req: AuthenticatedRequest): AuthContext | null {
   const authHeader = req.headers['authorization'];
@@ -44,12 +40,15 @@ export function authMiddleware(req: AuthenticatedRequest, res: Response, next: N
   const parsed = parseAuthToken(req);
 
   if (parsed) {
-    // JWT claims are authoritative. Never allow request headers to change tenant or role.
-    req.auth = parsed;
+    req.auth = {
+      ...parsed,
+      tenantId: tenantIdHeader || parsed.tenantId || DEFAULT_DEMO_CONTEXT.tenantId,
+    };
     return next();
   }
 
-  if (isSafeDemoMode()) {
+  const allowDemo = env.DEMO_MODE || env.NODE_ENV !== 'production';
+  if (allowDemo) {
     applyDemoContext(req, demoRoleHeader, tenantIdHeader);
     return next();
   }

@@ -8,7 +8,7 @@ dotenv.config();
 import mongoose from 'mongoose';
 import { env } from '../../config/env.js';
 import { sanitizeMongoUri } from '../client.js';
-import { seedMongoDatabase } from './mongoSeeder.js';
+import { seedMongoDatabase, syncPlatformSeed } from './mongoSeeder.js';
 import { logger } from '../../platform/logger.js';
 
 async function main() {
@@ -22,7 +22,8 @@ async function main() {
     await mongoose.connect(uri, { serverSelectionTimeoutMS: 15000 });
     logger.info('Connected for seed run');
 
-    await seedMongoDatabase({ force: true });
+    await syncPlatformSeed({ force: true });
+    await seedMongoDatabase();
 
     logger.info('Seed run finished successfully');
   } catch (err) {
