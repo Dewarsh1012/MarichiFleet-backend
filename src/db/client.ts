@@ -1,7 +1,7 @@
 import mongoose from 'mongoose';
 import { env } from '../config/env.js';
 import { logger } from '../platform/logger.js';
-import { seedMongoDatabase } from './seeds/mongoSeeder.js';
+import { bootstrap } from './seeds/mongoSeeder.js';
 
 let isMongoConnected = false;
 let activeMongoUri = '';
@@ -30,6 +30,15 @@ export function sanitizeMongoUri(rawUri: string): string {
   }
 }
 
+async function runBootstrapSafely(): Promise<void> {
+  try {
+    await bootstrap();
+  } catch (err) {
+    // Bootstrap failures must never crash the API; log and continue.
+    logger.error({ err, msg: 'bootstrap: run failed (continuing)' });
+  }
+}
+
 export async function initDatabase(): Promise<boolean> {
   if (env.MONGODB_URI) {
     const targetUri = sanitizeMongoUri(env.MONGODB_URI);
@@ -39,18 +48,15 @@ export async function initDatabase(): Promise<boolean> {
       });
       isMongoConnected = true;
       activeMongoUri = targetUri;
-      logger.info(' Connected to MongoDB at ' + targetUri.replace(/\/\/.*@/, '//***@'));
-      if (env.SEED_ON_BOOT) {
-        logger.info('SEED_ON_BOOT enabled; synchronizing seed data');
-        await seedMongoDatabase({ force: false });
-      }
+      logger.info(' Connected to database at ' + targetUri.replace(/\/\/.*@/, '//***@'));
+      await runBootstrapSafely();
       return true;
     } catch (error) {
       isMongoConnected = false;
       if (env.NODE_ENV === 'production') {
-        throw new Error(`MongoDB connection failed: ${(error as Error).message}`, { cause: error });
+        throw new Error(`Database connection failed: ${(error as Error).message}`, { cause: error });
       }
-      logger.warn(`MongoDB connection failed (${(error as Error).message}); trying an in-memory development database`);
+      logger.warn(`Database connection failed (${(error as Error).message}); trying an in-memory development database`);
     }
   } else if (env.NODE_ENV === 'production') {
     throw new Error('MONGODB_URI is required in production');
@@ -64,14 +70,11 @@ export async function initDatabase(): Promise<boolean> {
     await mongoose.connect(memUri);
     isMongoConnected = true;
     activeMongoUri = memUri;
-    logger.info(' Real MongoDB engine initialized and connected at ' + memUri);
-    if (env.SEED_ON_BOOT) {
-      logger.info('SEED_ON_BOOT enabled; synchronizing seed data');
-      await seedMongoDatabase({ force: false });
-    }
+    logger.info(' In-memory database initialized and connected at ' + memUri);
+    await runBootstrapSafely();
     return true;
   } catch (err) {
-    logger.error({ err, msg: ' Failed to start MongoDB engine.' });
+    logger.error({ err, msg: ' Failed to start in-memory database.' });
     isMongoConnected = false;
     return false;
   }

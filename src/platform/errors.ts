@@ -53,4 +53,8 @@ export class AppError extends Error {
   static conflict(msg: string, details?: Record<string, unknown>): AppError {
     return new AppError('CONCURRENCY_CONFLICT', msg, 409, details);
   }
+
+  static internal(msg = 'Internal server error', details?: Record<string, unknown>): AppError {
+    return new AppError('INTERNAL_ERROR', msg, 500, details);
+  }
 }

@@ -30,14 +30,18 @@ export interface IUser {
   email: string;
   passwordHash?: string;
   name: string;
+  phone?: string;
   avatarUrl?: string;
   googleId?: string;
   authProvider: 'google' | 'local' | 'demo';
   role: string;
+  roleId?: string;
   tenantId: string;
   orgId: string;
   branches: string[];
+  branchIds: string[];
   permissions: string[];
+  active: boolean;
   mustResetPassword?: boolean;
   consignorId?: string;
   consigneeId?: string;
@@ -51,14 +55,18 @@ const UserSchema = new Schema<IUser>({
   email: { type: String, required: true, unique: true, lowercase: true, trim: true },
   passwordHash: { type: String },
   name: { type: String, required: true },
+  phone: { type: String },
   avatarUrl: { type: String },
   googleId: { type: String, sparse: true },
   authProvider: { type: String, enum: ['google', 'local', 'demo'], default: 'local' },
-  role: { type: String, default: 'FLEET_OWNER' },
-  tenantId: { type: String, required: true, default: 'tenant_delhi_01' },
-  orgId: { type: String, default: 'org_marichi_logistics' },
-  branches: { type: [String], default: ['DL-Okhla', 'MH-Bhiwandi'] },
-  permissions: { type: [String], default: ['*'] },
+  role: { type: String, default: 'user' },
+  roleId: { type: String },
+  tenantId: { type: String, required: true },
+  orgId: { type: String, default: '' },
+  branches: { type: [String], default: [] },
+  branchIds: { type: [String], default: [] },
+  permissions: { type: [String], default: [] },
+  active: { type: Boolean, default: true },
   mustResetPassword: { type: Boolean, default: false },
   consignorId: { type: String },
   consigneeId: { type: String },
@@ -69,16 +77,24 @@ const UserSchema = new Schema<IUser>({
 export const UserModel = mongoose.models.User || mongoose.model<IUser>('User', UserSchema);
 
 // --- TENANT MODEL ---
+export interface ITenantSettings {
+  country?: string;
+  baseCurrency?: string;
+  displayCurrencies?: string[];
+  autoConvertReports?: boolean;
+  [key: string]: any;
+}
+
 export interface ITenant {
   id: string;
   name: string;
-  gstin: string;
-  pan: string;
-  stateCode: string;
-  registeredAddress: string;
-  branches: Array<{ code: string; name: string; gstin: string; address?: string; phone?: string; manager?: string }>;
+  gstin?: string;
+  pan?: string;
+  stateCode?: string;
+  registeredAddress?: string;
+  branches: Array<{ code: string; name: string; gstin?: string; address?: string; phone?: string; manager?: string }>;
   modulesEnabled: string[];
-  settings?: Record<string, any>;
+  settings: ITenantSettings;
   status: 'ACTIVE' | 'SUSPENDED' | 'TRIAL';
   createdAt: Date;
 }
@@ -118,7 +134,19 @@ const TenantSchema = new Schema<ITenant>({
       'reports',
     ],
   },
-  settings: { type: Schema.Types.Mixed, default: {} },
+  // Kept as Mixed to preserve backward compatibility with any callers that
+  // stash additional tenant-scoped config here. bootstrap() and admin
+  // endpoints ensure country / baseCurrency / displayCurrencies / autoConvertReports
+  // are always populated.
+  settings: {
+    type: Schema.Types.Mixed,
+    default: () => ({
+      country: 'India',
+      baseCurrency: 'INR',
+      displayCurrencies: ['INR', 'USD', 'AED', 'ZMW'],
+      autoConvertReports: true,
+    }),
+  },
   status: { type: String, enum: ['ACTIVE', 'SUSPENDED', 'TRIAL'], default: 'ACTIVE' },
   createdAt: { type: Date, default: Date.now },
 });
@@ -1396,14 +1424,15 @@ export const RouteModel = mongoose.models.Route || mongoose.model<IRoute>('Route
 // ==========================================
 export interface IRole {
   id: string;
-  code: string;
+  code?: string;
   name: string;
   description: string;
-  tenantId: string; // '*' for system-wide roles, or specific tenantId
+  tenantId: string; // '*' for system-wide roles, or a specific tenantId
   permissions: string[];
   isSystem: boolean;
   branchRestricted: boolean;
   allowedBranches?: string[];
+  deletedAt?: Date;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -1411,17 +1440,19 @@ export interface IRole {
 const RoleSchema = new Schema<IRole>(
   {
     id: { type: String, required: true, unique: true },
-    code: { type: String, required: true, index: true },
+    code: { type: String, index: true },
     name: { type: String, required: true },
     description: { type: String, default: '' },
-    tenantId: { type: String, required: true, default: '*' },
+    tenantId: { type: String, required: true },
     permissions: { type: [String], default: [] },
     isSystem: { type: Boolean, default: false },
     branchRestricted: { type: Boolean, default: false },
     allowedBranches: { type: [String], default: [] },
+    deletedAt: { type: Date },
   },
   { timestamps: true }
 );
+RoleSchema.index({ tenantId: 1, name: 1 }, { unique: true });
 
 export const RoleModel = mongoose.models.Role || mongoose.model<IRole>('Role', RoleSchema);
 

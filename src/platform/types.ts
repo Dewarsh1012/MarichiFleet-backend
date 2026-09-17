@@ -1,6 +1,11 @@
 import { Request } from 'express';
 
 export type UserRole =
+  // New production roles (single super admin + per-tenant owner + per-tenant users)
+  | 'platform_admin'
+  | 'tenant_owner'
+  | 'user'
+  // Legacy roles retained for backward compatibility with existing routers/tests.
   | 'SUPER_ADMIN'
   | 'ADMIN'
   | 'BRANCH_MANAGER'

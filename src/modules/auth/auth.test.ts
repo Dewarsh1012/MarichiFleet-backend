@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { hashPassword, isBcryptPasswordHash, verifyStoredPassword } from './auth.router.js';
+import { parseEnvironment } from '../../config/env.js';
 
 test('passwords are hashed and verified with bcrypt', async () => {
   const hash = await hashPassword('StrongDemoPassword!');
@@ -21,4 +22,41 @@ test('known plaintext credentials can be upgraded only on an explicit legacy pat
   assert.equal(result.valid, true);
   assert.ok(result.upgradedHash);
   assert.equal(isBcryptPasswordHash(result.upgradedHash), true);
+});
+
+test('production refuses to boot when SUPERADMIN_EMAIL is set without SUPERADMIN_PASSWORD', () => {
+  assert.throws(
+    () =>
+      parseEnvironment({
+        NODE_ENV: 'production',
+        MONGODB_URI: 'mongodb://localhost/x',
+        SUPERADMIN_EMAIL: 'admin@example.com',
+      }),
+    /SUPERADMIN_PASSWORD is required in production/,
+  );
+});
+
+test('SUPERADMIN_PASSWORD must be at least 12 characters', () => {
+  assert.throws(
+    () =>
+      parseEnvironment({
+        NODE_ENV: 'production',
+        MONGODB_URI: 'mongodb://localhost/x',
+        SUPERADMIN_EMAIL: 'admin@example.com',
+        SUPERADMIN_PASSWORD: 'short',
+      }),
+    /Invalid environment variables/,
+  );
+});
+
+test('FX_BOOTSTRAP defaults to true and can be toggled off', () => {
+  const on = parseEnvironment({ NODE_ENV: 'development' });
+  assert.equal(on.FX_BOOTSTRAP, true);
+  const off = parseEnvironment({ NODE_ENV: 'development', FX_BOOTSTRAP: 'false' });
+  assert.equal(off.FX_BOOTSTRAP, false);
+});
+
+test('BOOTSTRAP_TENANT_ID defaults to "platform"', () => {
+  const parsed = parseEnvironment({ NODE_ENV: 'development' });
+  assert.equal(parsed.BOOTSTRAP_TENANT_ID, 'platform');
 });

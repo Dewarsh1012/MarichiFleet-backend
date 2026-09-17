@@ -1,4 +1,4 @@
-import { AuthContext, UserRole } from '../types.js';
+import { AuthContext } from '../types.js';
 import { AppError } from '../errors.js';
 import { Response, NextFunction } from 'express';
 import { AuthenticatedRequest } from '../types.js';
@@ -48,16 +48,53 @@ export type Resource =
   | 'automation'
   | 'whatsapp';
 
+// Map coarse authz Actions (read/write/create/update/delete) to concrete
+// string permission suffixes used in the new module:action model.
+function actionSuffixes(action: Action): string[] {
+  switch (action) {
+    case 'read':
+      return ['read', '*'];
+    case 'create':
+    case 'update':
+    case 'delete':
+    case 'write':
+    case 'assign_asset':
+    case 'dispatch':
+    case 'finalise_invoice':
+    case 'post_ledger':
+      return ['write', '*'];
+    case 'approve':
+    case 'override':
+      return ['decide', 'write', '*'];
+    default:
+      return ['*'];
+  }
+}
+
 export function can(ctx: AuthContext, action: Action, resource: Resource): boolean {
   const { role, permissions = [] } = ctx;
 
-  // 1. Wildcard permissions check
+  // 1a. Wildcard and legacy permission encodings.
   if (permissions.includes('*') || permissions.includes(`${resource}:*`) || permissions.includes(`${resource}:${action}`)) {
     return true;
   }
 
-  // 2. Super Admin & Fleet Owner have omnipotent access across all tenants & modules
-  if (role === 'SUPER_ADMIN' || role === 'FLEET_OWNER') {
+  // 1b. Simple string permission model. e.g. "trips:read" satisfies read
+  //     actions on trips; "trips:write" satisfies write/create/update/delete.
+  for (const suffix of actionSuffixes(action)) {
+    if (permissions.includes(`${resource}:${suffix}`)) return true;
+  }
+
+  // 2. Platform Super Admin & legacy SUPER_ADMIN & FLEET_OWNER: omnipotent access.
+  if (role === 'platform_admin' || role === 'SUPER_ADMIN' || role === 'FLEET_OWNER') {
+    return true;
+  }
+
+  // 2b. Tenant Owner (per-tenant admin) — full authority inside their tenant,
+  //     but never on the tenants collection (only platform_admin can create /
+  //     delete tenants); admin.router.ts enforces this at the write layer.
+  if (role === 'tenant_owner') {
+    if (resource === 'tenants' && (action === 'create' || action === 'delete')) return false;
     return true;
   }
 

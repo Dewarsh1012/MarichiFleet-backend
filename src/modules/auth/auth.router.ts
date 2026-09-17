@@ -1,14 +1,26 @@
-import { Router, Response } from 'express';
+/**
+ * Authentication routes.
+ *
+ * Hardened production behaviour:
+ *   - No auto-provisioning: an unknown identifier is always rejected.
+ *   - No persona switching (removed in every environment).
+ *   - Password verification is bcrypt-only in production paths; legacy plaintext
+ *     migration is available only inside verifyStoredPassword when explicitly
+ *     requested (unit tests) and never on the login path.
+ *   - Google Sign-In verifies id_token server-side against GOOGLE_CLIENT_ID and
+ *     rejects the request if the resolved email does not map to an existing user.
+ *   - Simple fixed-window in-memory rate limit on login endpoints.
+ */
+import { Router, Response, NextFunction } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import mongoose from 'mongoose';
 import { z } from 'zod';
 import { OAuth2Client } from 'google-auth-library';
-import { v4 as uuidv4 } from 'uuid';
 import { env } from '../../config/env.js';
 import { AppError } from '../../platform/errors.js';
-import { AuthenticatedRequest, UserRole } from '../../platform/types.js';
-import { isSafeDemoMode, parseAuthToken } from '../../platform/middleware/auth.js';
+import { AuthenticatedRequest } from '../../platform/types.js';
+import { parseAuthToken } from '../../platform/middleware/auth.js';
 import { UserModel } from '../../db/models/index.js';
 import { logger } from '../../platform/logger.js';
 
@@ -28,7 +40,7 @@ export async function hashPassword(password: string): Promise<string> {
 export async function verifyStoredPassword(
   stored: string | undefined,
   provided: string | undefined,
-  allowLegacyPlaintext = isSafeDemoMode(),
+  allowLegacyPlaintext = false,
 ): Promise<{ valid: boolean; upgradedHash?: string }> {
   if (!stored || !provided) return { valid: false };
   if (isBcryptPasswordHash(stored)) {
@@ -38,112 +50,131 @@ export async function verifyStoredPassword(
   return { valid: true, upgradedHash: await hashPassword(provided) };
 }
 
+// ----------------------------- Rate limiting -----------------------------
+
+interface RateBucket {
+  count: number;
+  resetAt: number;
+}
+const RATE_WINDOW_MS = 60 * 1000; // 1 minute
+const RATE_MAX_HITS = 20; // per identifier + IP per window
+const rateBuckets = new Map<string, RateBucket>();
+
+function rateLimit(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
+  const identifier =
+    (req.body?.email as string | undefined)?.toLowerCase().trim() ||
+    (req.body?.credential as string | undefined)?.slice(0, 24) ||
+    'anonymous';
+  const key = `${req.ip ?? 'unknown'}::${identifier}`;
+  const now = Date.now();
+  const bucket = rateBuckets.get(key);
+  if (!bucket || bucket.resetAt <= now) {
+    rateBuckets.set(key, { count: 1, resetAt: now + RATE_WINDOW_MS });
+    return next();
+  }
+  bucket.count += 1;
+  if (bucket.count > RATE_MAX_HITS) {
+    res.setHeader('Retry-After', Math.ceil((bucket.resetAt - now) / 1000).toString());
+    return next(AppError.badRequest('Too many authentication attempts. Please wait and try again.'));
+  }
+  next();
+}
+
+// ------------------------------- Schemas ---------------------------------
+
 const loginSchema = z.object({
-  email: z.string().min(1), // can be email or username
-  password: z.string().min(1).optional(),
-  demoRole: z.string().optional(),
+  email: z.string().min(3).max(320),
+  password: z.string().min(1),
 });
 
 const googleAuthSchema = z.object({
-  credential: z.string().optional(), // Google ID Token
-  email: z.string().email().optional(),
-  name: z.string().optional(),
-  avatarUrl: z.string().optional(),
-  googleId: z.string().optional(),
-  role: z.string().optional(),
+  credential: z.string().min(10), // Google ID Token is mandatory now
 });
 
-// 1. Password / Demo Login (Supports Super Admin & Standard Users)
-authRouter.post('/login', async (req: AuthenticatedRequest, res: Response, next) => {
+const resetPasswordSchema = z.object({
+  currentPassword: z.string().min(1),
+  newPassword: z.string().min(12),
+});
+
+// ----------------------------- Helpers -----------------------------------
+
+function buildTokenPayload(user: {
+  userId: string;
+  email: string;
+  name: string;
+  tenantId: string;
+  orgId?: string;
+  role: string;
+  branches?: string[];
+  branchIds?: string[];
+  permissions?: string[];
+  mustResetPassword?: boolean;
+  avatarUrl?: string;
+  consignorId?: string;
+  consigneeId?: string;
+}) {
+  return {
+    userId: user.userId,
+    email: user.email,
+    name: user.name,
+    tenantId: user.tenantId,
+    orgId: user.orgId || '',
+    role: user.role,
+    branches: user.branches || [],
+    branchIds: user.branchIds || [],
+    permissions: user.permissions || [],
+    mustResetPassword: user.mustResetPassword ?? false,
+    avatarUrl: user.avatarUrl,
+    consignorId: user.consignorId,
+    consigneeId: user.consigneeId,
+  };
+}
+
+// ------------------------------- Routes ----------------------------------
+
+// 1. Email/password login.
+authRouter.post('/login', rateLimit, async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
   try {
-    const { email: identifier, password, demoRole } = loginSchema.parse(req.body);
-    const role = (demoRole || 'FLEET_OWNER') as UserRole;
-    const defaultTenantId = 'tenant_delhi_01';
+    const { email, password } = loginSchema.parse(req.body);
+    const cleanId = email.toLowerCase().trim();
 
-    let user: any = null;
-    if (mongoose.connection.readyState === 1) {
-      try {
-        const cleanId = identifier.toLowerCase().trim();
-        user = await UserModel.findOne({
-          $or: [{ email: cleanId }, { username: cleanId }],
-        });
-
-        if (user) {
-          const passwordResult = await verifyStoredPassword(user.passwordHash, password);
-          if (!passwordResult.valid) {
-            return next(AppError.unauthorized('Invalid email or password.'));
-          }
-          if (passwordResult.upgradedHash) {
-            user.passwordHash = passwordResult.upgradedHash;
-            await user.save();
-            logger.info({ userId: user.userId, msg: 'Migrated legacy development password hash to bcrypt' });
-          }
-        }
-
-        // Demo users may be created only on the explicit non-production demo path.
-        if (!user && isSafeDemoMode() && (cleanId === 'superadmin' || cleanId === 'superadmin@marichifleet.com')) {
-          if (password !== 'Admin@123') {
-            return next(AppError.unauthorized('Invalid email or password.'));
-          }
-          user = await UserModel.create({
-            userId: 'usr_superadmin',
-            username: 'superadmin',
-            email: 'superadmin@marichifleet.com',
-            name: 'Super Administrator',
-            role: 'SUPER_ADMIN',
-            tenantId: '*',
-            orgId: 'org_marichi_global',
-            branches: ['ALL'],
-            permissions: ['*'],
-            passwordHash: await hashPassword(password),
-            mustResetPassword: true,
-            authProvider: 'local',
-            status: 'ACTIVE',
-          });
-        } else if (!user && isSafeDemoMode()) {
-          user = await UserModel.create({
-            userId: `usr_${uuidv4().slice(0, 8)}`,
-            email: cleanId.includes('@') ? cleanId : `${cleanId}@marichifleet.com`,
-            username: cleanId.includes('@') ? cleanId.split('@')[0] : cleanId,
-            name: cleanId.split('@')[0].toUpperCase(),
-            role,
-            tenantId: defaultTenantId,
-            orgId: 'org_marichi_logistics',
-            branches: ['DL-Okhla', 'MH-Bhiwandi', 'KA-Peenya'],
-            permissions: ['*'],
-            passwordHash: password ? await hashPassword(password) : undefined,
-            authProvider: 'local',
-            status: 'ACTIVE',
-          });
-        }
-      } catch (dbErr) {
-        if (!isSafeDemoMode()) throw dbErr;
-        logger.warn({ err: dbErr, msg: 'MongoDB login failed; explicit demo mode will use stateless authentication' });
-      }
+    if (mongoose.connection.readyState !== 1) {
+      return next(AppError.internal('database unavailable'));
     }
 
-    if (!user && !isSafeDemoMode()) {
+    const user = await UserModel.findOne({
+      $or: [{ email: cleanId }, { username: cleanId }],
+    });
+
+    if (!user) {
+      return next(AppError.unauthorized('Invalid email or password.'));
+    }
+    if (user.active === false || user.status === 'SUSPENDED' || user.status === 'INACTIVE') {
+      return next(AppError.unauthorized('Account is not active. Contact your administrator.'));
+    }
+
+    const passwordResult = await verifyStoredPassword(user.passwordHash, password, false);
+    if (!passwordResult.valid) {
       return next(AppError.unauthorized('Invalid email or password.'));
     }
 
-    const payload: any = {
-      userId: user?.userId || `usr_${uuidv4().slice(0, 8)}`,
-      email: user?.email || (identifier.includes('@') ? identifier.toLowerCase() : `${identifier.toLowerCase()}@marichifleet.com`),
-      username: user?.username || identifier.toLowerCase(),
-      name: user?.name || identifier.split('@')[0].toUpperCase(),
-      avatarUrl: user?.avatarUrl,
-      tenantId: user?.tenantId || defaultTenantId,
-      orgId: user?.orgId || 'org_marichi_logistics',
-      role: (user?.role || role) as UserRole,
-      branches: user?.branches || ['DL-Okhla', 'MH-Bhiwandi', 'KA-Peenya'],
-      permissions: user?.permissions || ['*'],
-      mustResetPassword: user?.mustResetPassword ?? false,
-      consignorId: user?.consignorId,
-      consigneeId: user?.consigneeId,
-    };
+    const payload = buildTokenPayload({
+      userId: user.userId,
+      email: user.email,
+      name: user.name,
+      tenantId: user.tenantId,
+      orgId: user.orgId,
+      role: user.role,
+      branches: user.branches,
+      branchIds: user.branchIds,
+      permissions: user.permissions,
+      mustResetPassword: user.mustResetPassword,
+      avatarUrl: user.avatarUrl,
+      consignorId: user.consignorId,
+      consigneeId: user.consigneeId,
+    });
 
     const token = jwt.sign(payload, env.JWT_SECRET, { expiresIn: '7d' });
-
     res.json({
       success: true,
       data: {
@@ -157,143 +188,79 @@ authRouter.post('/login', async (req: AuthenticatedRequest, res: Response, next)
   }
 });
 
-// 1.1 Force Password Reset
-authRouter.post('/reset-forced-password', async (req: AuthenticatedRequest, res: Response, next) => {
+// 2. Google OAuth Sign-In. Verifies id_token against GOOGLE_CLIENT_ID.
+authRouter.post('/google', rateLimit, async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
   try {
-    const { email, oldPassword, newPassword } = z.object({
-      email: z.string().min(1),
-      oldPassword: z.string().min(1),
-      newPassword: z.string().min(8),
-    }).parse(req.body);
+    const { credential } = googleAuthSchema.parse(req.body);
 
-    const clean = email.toLowerCase().trim();
-    const user = await UserModel.findOne({
-      $or: [{ email: clean }, { username: clean }],
+    if (!env.GOOGLE_CLIENT_ID) {
+      return next(AppError.internal('Google Sign-In is not configured on this server.'));
+    }
+
+    let verifiedEmail: string | undefined;
+    let verifiedName: string | undefined;
+    let verifiedAvatar: string | undefined;
+    try {
+      const ticket = await googleClient.verifyIdToken({
+        idToken: credential,
+        audience: env.GOOGLE_CLIENT_ID,
+      });
+      const payload = ticket.getPayload();
+      if (!payload || !payload.email || !payload.email_verified) {
+        return next(AppError.unauthorized('Google credential could not be verified.'));
+      }
+      verifiedEmail = payload.email.toLowerCase();
+      verifiedName = payload.name;
+      verifiedAvatar = payload.picture;
+    } catch (verifyErr) {
+      logger.warn({ err: verifyErr, msg: 'Google id_token verification failed' });
+      return next(AppError.unauthorized('Google credential could not be verified.'));
+    }
+
+    if (mongoose.connection.readyState !== 1) {
+      return next(AppError.internal('database unavailable'));
+    }
+
+    const user = await UserModel.findOne({ email: verifiedEmail });
+    if (!user) {
+      // No auto-provision. Deny access.
+      return next(AppError.unauthorized('No account exists for this Google identity. Contact your administrator.'));
+    }
+    if (user.active === false || user.status === 'SUSPENDED' || user.status === 'INACTIVE') {
+      return next(AppError.unauthorized('Account is not active. Contact your administrator.'));
+    }
+
+    // Refresh cached identity attributes only (never role/tenant).
+    let dirty = false;
+    if (verifiedName && verifiedName !== user.name) { user.name = verifiedName; dirty = true; }
+    if (verifiedAvatar && verifiedAvatar !== user.avatarUrl) { user.avatarUrl = verifiedAvatar; dirty = true; }
+    if (user.authProvider !== 'google') { user.authProvider = 'google'; dirty = true; }
+    if (dirty) await user.save();
+
+    const payload = buildTokenPayload({
+      userId: user.userId,
+      email: user.email,
+      name: user.name,
+      tenantId: user.tenantId,
+      orgId: user.orgId,
+      role: user.role,
+      branches: user.branches,
+      branchIds: user.branchIds,
+      permissions: user.permissions,
+      mustResetPassword: user.mustResetPassword,
+      avatarUrl: user.avatarUrl,
+      consignorId: user.consignorId,
+      consigneeId: user.consigneeId,
     });
 
-    if (!user) return next(new Error('User not found'));
-
-    const passwordResult = await verifyStoredPassword(user.passwordHash, oldPassword);
-    if (!passwordResult.valid) {
-      return next(AppError.unauthorized('Current password is incorrect.'));
-    }
-
-    user.passwordHash = await hashPassword(newPassword);
-    user.mustResetPassword = false;
-    await user.save();
-
-    res.json({ success: true, message: 'Password has been successfully reset. You may now continue.' });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// 2. Google OAuth Sign-In (Google Identity Services / Token Exchange)
-authRouter.post('/google', async (req: AuthenticatedRequest, res: Response, next) => {
-  try {
-    const body = googleAuthSchema.parse(req.body);
-    let verifiedEmail = body.email;
-    let verifiedName = body.name;
-    let verifiedAvatar = body.avatarUrl;
-    let verifiedGoogleId = body.googleId;
-
-    // If Google ID token credential provided, verify with Google
-    if (body.credential) {
-      try {
-        const ticket = await googleClient.verifyIdToken({
-          idToken: body.credential,
-          audience: env.GOOGLE_CLIENT_ID || undefined,
-        });
-        const payload = ticket.getPayload();
-        if (payload) {
-          verifiedEmail = payload.email;
-          verifiedName = payload.name;
-          verifiedAvatar = payload.picture;
-          verifiedGoogleId = payload.sub;
-        }
-      } catch (verifyErr) {
-        if (!isSafeDemoMode()) {
-          return next(AppError.unauthorized('Google credential verification failed.'));
-        }
-        logger.warn({ err: verifyErr, msg: 'Google verification failed; decoding credential in explicit demo mode' });
-        // Demo-only fallback: decode JWT payload without network.
-        try {
-          const decoded: any = jwt.decode(body.credential);
-          if (decoded && decoded.email) {
-            verifiedEmail = decoded.email;
-            verifiedName = decoded.name || decoded.email.split('@')[0];
-            verifiedAvatar = decoded.picture;
-            verifiedGoogleId = decoded.sub;
-          }
-        } catch (decodeErr) {
-          logger.warn({ err: decodeErr, msg: 'JWT decode of credential failed' });
-        }
-      }
-    }
-
-    if (!verifiedEmail) {
-      return next(AppError.badRequest('Unable to verify Google authentication payload. Email is required.'));
-    }
-
-    const tenantId = 'tenant_delhi_01';
-    const role: UserRole = (body.role as UserRole) || 'FLEET_OWNER';
-
-    // Find or create in MongoDB if connected
-    let user: any = null;
-    if (mongoose.connection.readyState === 1) {
-      try {
-        user = await UserModel.findOne({ email: verifiedEmail.toLowerCase() });
-
-        if (user) {
-          user.name = verifiedName || user.name;
-          user.avatarUrl = verifiedAvatar || user.avatarUrl;
-          user.googleId = verifiedGoogleId || user.googleId;
-          user.authProvider = 'google';
-          await user.save();
-          logger.info(` Google user logged in: ${user.email} (MongoDB ID: ${user._id})`);
-        } else {
-          user = await UserModel.create({
-            userId: `usr_g_${uuidv4().slice(0, 8)}`,
-            email: verifiedEmail.toLowerCase(),
-            name: verifiedName || verifiedEmail.split('@')[0],
-            avatarUrl: verifiedAvatar,
-            googleId: verifiedGoogleId,
-            authProvider: 'google',
-            role,
-            tenantId,
-            orgId: 'org_marichi_logistics',
-            branches: ['DL-Okhla', 'MH-Bhiwandi', 'KA-Peenya'],
-            permissions: ['*'],
-          });
-          logger.info(` Created new Google user in MongoDB: ${user.email} (ID: ${user.userId})`);
-        }
-      } catch (dbErr) {
-        if (!isSafeDemoMode()) throw dbErr;
-        logger.warn({ err: dbErr, msg: 'MongoDB Google auth failed; explicit demo mode will use stateless authentication' });
-      }
-    }
-
-    const authPayload = {
-      userId: user?.userId || `usr_g_${(verifiedGoogleId || uuidv4()).slice(0, 8)}`,
-      email: (user?.email || verifiedEmail).toLowerCase(),
-      name: user?.name || verifiedName || verifiedEmail.split('@')[0],
-      avatarUrl: user?.avatarUrl || verifiedAvatar,
-      tenantId: user?.tenantId || tenantId,
-      orgId: user?.orgId || 'org_marichi_logistics',
-      role: (user?.role || role) as UserRole,
-      branches: user?.branches || ['DL-Okhla', 'MH-Bhiwandi', 'KA-Peenya'],
-      permissions: user?.permissions || ['*'],
-      authProvider: 'google',
-    };
-
-    const token = jwt.sign(authPayload, env.JWT_SECRET, { expiresIn: '7d' });
-
+    const token = jwt.sign(payload, env.JWT_SECRET, { expiresIn: '7d' });
     res.json({
       success: true,
-      message: `Signed in successfully with Google as ${authPayload.name}`,
+      message: `Signed in successfully as ${payload.name}`,
       data: {
         token,
-        user: authPayload,
+        user: payload,
+        mustResetPassword: payload.mustResetPassword,
       },
     });
   } catch (err) {
@@ -302,69 +269,74 @@ authRouter.post('/google', async (req: AuthenticatedRequest, res: Response, next
 });
 
 // 3. Current User Context
-authRouter.get('/me', async (req: AuthenticatedRequest, res: Response, next) => {
+authRouter.get('/me', async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
   const auth = parseAuthToken(req) ?? req.auth;
   if (!auth) {
     return next(AppError.unauthorized('Sign in to load your profile.'));
   }
 
-  // Fetch fresh user from MongoDB
   try {
-    const user = await UserModel.findOne({ email: auth.email.toLowerCase() });
-    if (user) {
-      return res.json({
-        success: true,
-        data: {
-          ...auth,
-          name: user.name,
-          avatarUrl: user.avatarUrl,
-          role: user.role,
-          authProvider: user.authProvider,
-          tenantId: user.tenantId,
-          branches: user.branches,
-        },
-      });
+    if (mongoose.connection.readyState === 1) {
+      const user = await UserModel.findOne({ email: auth.email.toLowerCase() }).lean() as any;
+      if (user) {
+        return res.json({
+          success: true,
+          data: {
+            ...auth,
+            name: user.name,
+            avatarUrl: user.avatarUrl,
+            role: user.role,
+            authProvider: user.authProvider,
+            tenantId: user.tenantId,
+            branches: user.branches,
+            branchIds: user.branchIds,
+            permissions: user.permissions,
+            mustResetPassword: user.mustResetPassword ?? false,
+          },
+        });
+      }
     }
-  } catch (e) {
-    // fallback
+  } catch {
+    // fall through to token data
   }
 
-  res.json({
-    success: true,
-    data: auth,
-  });
+  res.json({ success: true, data: auth });
 });
 
-// 4. Persona Switcher (demo / development only)
-authRouter.post('/persona-switch', async (req: AuthenticatedRequest, res: Response, next) => {
-  if (!isSafeDemoMode()) {
-    return next(AppError.forbidden('Persona switching requires explicit non-production demo mode.'));
-  }
+// 4. Authenticated password reset — clears mustResetPassword.
+authRouter.post('/reset-password', async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
   try {
-    const { role } = z.object({ role: z.string() }).parse(req.body);
-    const tenantId = parseAuthToken(req)?.tenantId || req.auth?.tenantId || 'tenant_delhi_01';
+    const auth = req.auth ?? parseAuthToken(req);
+    if (!auth) return next(AppError.unauthorized('Sign in to reset your password.'));
 
-    const payload = {
-      userId: `usr_${role.toLowerCase()}_01`,
-      email: `${role.toLowerCase()}@marichifleet.com`,
-      name: `${role} Active User`,
-      tenantId,
-      orgId: 'org_marichi_logistics',
-      role: role as UserRole,
-      branches: ['DL-Okhla', 'MH-Bhiwandi'],
-      permissions: ['*'],
-    };
+    const { currentPassword, newPassword } = resetPasswordSchema.parse(req.body);
+    if (currentPassword === newPassword) {
+      return next(AppError.badRequest('New password must differ from the current password.'));
+    }
 
-    const token = jwt.sign(payload, env.JWT_SECRET, { expiresIn: '7d' });
+    const user = await UserModel.findOne({ email: auth.email.toLowerCase() });
+    if (!user) return next(AppError.unauthorized('User not found.'));
+
+    const passwordResult = await verifyStoredPassword(user.passwordHash, currentPassword, false);
+    if (!passwordResult.valid) {
+      return next(AppError.unauthorized('Current password is incorrect.'));
+    }
+
+    user.passwordHash = await hashPassword(newPassword);
+    user.mustResetPassword = false;
+    await user.save();
 
     res.json({
       success: true,
-      data: {
-        token,
-        user: payload,
-      },
+      message: 'Password updated. You may continue.',
     });
   } catch (err) {
     next(err);
   }
 });
+
+/*
+ * NOTE: /persona-switch has been removed in every environment.
+ * NOTE: /reset-forced-password (unauthenticated forced-reset) has been removed;
+ *       use POST /auth/reset-password once authenticated instead.
+ */

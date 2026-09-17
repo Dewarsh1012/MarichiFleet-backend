@@ -2,32 +2,17 @@ import { Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { env } from '../../config/env.js';
 import { AppError } from '../errors.js';
-import { AuthContext, AuthenticatedRequest, UserRole } from '../types.js';
+import { AuthContext, AuthenticatedRequest } from '../types.js';
 
-const DEFAULT_DEMO_CONTEXT: AuthContext = {
-  userId: 'usr_owner_01',
-  email: 'owner@marichifleet.com',
-  name: 'Rajesh Sharma',
-  tenantId: 'tenant_delhi_01',
-  orgId: 'org_marichi_logistics',
-  role: 'FLEET_OWNER',
-  branches: ['DL-Okhla', 'MH-Bhiwandi', 'KA-Peenya'],
-  permissions: ['*'],
-};
-
-function applyDemoContext(req: AuthenticatedRequest, role?: UserRole, tenantId?: string) {
-  req.auth = {
-    ...DEFAULT_DEMO_CONTEXT,
-    role: role || 'FLEET_OWNER',
-    tenantId: tenantId || DEFAULT_DEMO_CONTEXT.tenantId,
-  };
-}
-
+/**
+ * Retained for backward compatibility only. The former demo bypass has been
+ * removed: authentication is now JWT-only in every environment.
+ */
 export function isSafeDemoMode(): boolean {
-  return env.DEMO_MODE && env.NODE_ENV !== 'production';
+  return false;
 }
 
-/** Parse JWT from Authorization header without requiring full middleware chain. */
+/** Parse JWT from Authorization header without requiring the full middleware chain. */
 export function parseAuthToken(req: AuthenticatedRequest): AuthContext | null {
   const authHeader = req.headers['authorization'];
   if (!authHeader?.startsWith('Bearer ')) return null;
@@ -38,22 +23,13 @@ export function parseAuthToken(req: AuthenticatedRequest): AuthContext | null {
   }
 }
 
-export function authMiddleware(req: AuthenticatedRequest, res: Response, next: NextFunction) {
-  const demoRoleHeader = req.headers['x-demo-role'] as UserRole | undefined;
-  const tenantIdHeader = req.headers['x-tenant-id'] as string | undefined;
+export function authMiddleware(req: AuthenticatedRequest, _res: Response, next: NextFunction) {
   const parsed = parseAuthToken(req);
-
   if (parsed) {
     // JWT claims are authoritative. Never allow request headers to change tenant or role.
     req.auth = parsed;
     return next();
   }
-
-  if (isSafeDemoMode()) {
-    applyDemoContext(req, demoRoleHeader, tenantIdHeader);
-    return next();
-  }
-
   return next(AppError.unauthorized('Authentication required. Sign in or provide a valid Bearer token.'));
 }
 
