@@ -8,7 +8,8 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
-    "seed": "tsx src/db/seeds/runSeed.ts"
+    "seed": "tsx src/db/seeds/runSeed.ts",
+    "test": "tsx --test src/config/env.test.ts src/modules/auth/auth.test.ts src/platform/middleware/auth.test.ts src/modules/regions/countryPacks.test.ts src/platform/providers/providers.test.ts src/modules/sync/sync.test.ts src/tests/money_workflow.test.ts src/tests/tracking_compliance.test.ts src/tests/whatsapp.integration.test.ts"
   },
   "keywords": [
     "transport",
@@ -26,12 +27,12 @@
     "@types/jsonwebtoken": "^9.0.8",
     "@types/node": "^22.13.4",
     "@types/uuid": "^10.0.0",
+    "bcryptjs": "^3.0.3",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "google-auth-library": "^10.9.1",
     "jsonwebtoken": "^9.0.2",
-    "mongodb-memory-server": "^11.2.0",
     "mongoose": "^8.10.1",
     "pino": "^9.6.0",
     "pino-pretty": "^13.0.0",
@@ -40,6 +41,7 @@
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "mongodb-memory-server": "^11.2.0",
     "tsx": "^4.19.3"
   }
 }

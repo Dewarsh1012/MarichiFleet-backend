@@ -5,6 +5,7 @@ import { AuthenticatedRequest } from '../../platform/types.js';
 import { requirePermission } from '../../platform/middleware/authz.js';
 import { InvoiceModel, LedgerEntryModel } from '../../db/models/index.js';
 import { v4 as uuidv4 } from 'uuid';
+import { recordAudit } from '../../platform/audit/auditLogger.js';
 
 export const financeRouter = Router();
 
@@ -46,6 +47,7 @@ financeRouter.post('/invoices', requirePermission('create', 'invoices'), async (
     const taxableAmount = body.freightAmount + body.detentionAmount;
     const gstRate = 0.05;
     const totalGst = taxableAmount * gstRate;
+    const totalAmount = taxableAmount + totalGst;
     const invoiceId = `INV-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`;
 
     const newInvoice = await InvoiceModel.create({
@@ -61,11 +63,30 @@ financeRouter.post('/invoices', requirePermission('create', 'invoices'), async (
       cgstAmount: body.isInterState ? 0 : totalGst / 2,
       sgstAmount: body.isInterState ? 0 : totalGst / 2,
       igstAmount: body.isInterState ? totalGst : 0,
-      totalAmount: taxableAmount + totalGst,
+      totalAmount,
+      totalMoney: {
+        minorUnits: Math.round(totalAmount * 100),
+        currency: 'INR',
+        baseMinorUnits: Math.round(totalAmount * 100),
+        baseCurrency: 'INR',
+        rate: 1,
+        source: 'INVOICE_NATIVE',
+        asOf: new Date(),
+      },
+      paidMinorUnits: 0,
       status: 'DRAFT',
       issuedDate: new Date(),
       dueDate: new Date(Date.now() + 30 * 86400000),
       dsoDays: 0,
+    });
+    await recordAudit({
+      tenantId,
+      module: 'finance',
+      resourceId: invoiceId,
+      action: 'INVOICE_CREATED',
+      actor: req.auth!,
+      details: { tripId: body.tripId, totalMinorUnits: Math.round(totalAmount * 100), status: 'DRAFT' },
+      ipAddress: req.ip,
     });
 
     res.status(201).json({ success: true, data: newInvoice, message: `Invoice ${invoiceId} created as DRAFT.` });
@@ -118,6 +139,16 @@ financeRouter.post('/invoices/:invoiceId/finalise', requirePermission('update', 
         transactionDate: new Date(),
       });
     }
+
+    await recordAudit({
+      tenantId,
+      module: 'finance',
+      resourceId: invoice.id,
+      action: 'INVOICE_FINALISED',
+      actor: req.auth!,
+      details: { irn: invoice.irn, totalMinorUnits: invoice.totalMoney?.minorUnits ?? Math.round(invoice.totalAmount * 100) },
+      ipAddress: req.ip,
+    });
 
     res.json({ success: true, data: invoice, message: `Invoice ${invoice.id} finalised with IRN.` });
   } catch (err) { next(err); }

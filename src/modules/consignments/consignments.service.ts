@@ -47,7 +47,7 @@ export async function transitionConsignmentStatus(params: {
 }) {
   const { consignmentId, tenantId, nextStatus, remarks, location, actor, extraUpdates = {} } = params;
 
-  const consignment = await ConsignmentModel.findOne({ id: consignmentId });
+  const consignment = await ConsignmentModel.findOne({ id: consignmentId, tenantId });
   if (!consignment) {
     throw new Error(`Consignment ${consignmentId} not found`);
   }
@@ -59,8 +59,8 @@ export async function transitionConsignmentStatus(params: {
   }
 
   // Update consignment
-  const updated = await ConsignmentModel.findOneAndUpdate(
-    { id: consignmentId },
+  const updated: any = await ConsignmentModel.findOneAndUpdate(
+    { id: consignmentId, tenantId, currentStatus: prevStatus },
     {
       $set: {
         currentStatus: nextStatus,
@@ -70,6 +70,9 @@ export async function transitionConsignmentStatus(params: {
     },
     { new: true }
   ).lean();
+  if (!updated) {
+    throw new Error(`Consignment ${consignmentId} changed concurrently; retry the transition`);
+  }
 
   // Record immutable status history
   await ConsignmentStatusHistoryModel.create({

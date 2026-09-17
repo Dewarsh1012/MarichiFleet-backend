@@ -13,6 +13,7 @@ import {
   DriverModel,
 } from '../../db/models/index.js';
 import { generateConsignmentNumbers, transitionConsignmentStatus } from './consignments.service.js';
+import { canonicalConsignmentStatus } from './status.js';
 import { eventBus } from '../../platform/events/eventBus.js';
 import { recordAudit } from '../../platform/audit/auditLogger.js';
 import { v4 as uuidv4 } from 'uuid';
@@ -79,10 +80,7 @@ const createConsignmentSchema = z.object({
 consignmentsRouter.get('/', requirePermission('read', 'consignments'), async (req: AuthenticatedRequest, res: Response, next) => {
   try {
     const tenantId = req.auth!.tenantId;
-    const filter: any = {};
-    if (req.auth?.role !== 'SUPER_ADMIN') {
-      filter.tenantId = tenantId;
-    }
+    const filter: any = { tenantId };
 
     // Portal role scoping: Consignor / Consignee can only see their own
     if (req.auth?.role === 'CONSIGNOR_USER' && req.auth?.consignorId) {
@@ -92,7 +90,11 @@ consignmentsRouter.get('/', requirePermission('read', 'consignments'), async (re
       filter.consigneeId = req.auth.consigneeId;
     }
 
-    if (req.query.status) filter.currentStatus = req.query.status;
+    if (req.query.status) {
+      const status = canonicalConsignmentStatus(String(req.query.status));
+      if (!status) return res.status(400).json({ success: false, message: 'Invalid consignment status' });
+      filter.currentStatus = status;
+    }
     if (req.query.consignorId) filter.consignorId = req.query.consignorId;
     if (req.query.consigneeId) filter.consigneeId = req.query.consigneeId;
     if (req.query.bookingId) filter.bookingId = req.query.bookingId;
@@ -124,8 +126,10 @@ consignmentsRouter.get('/', requirePermission('read', 'consignments'), async (re
 consignmentsRouter.get('/:id', requirePermission('read', 'consignments'), async (req: AuthenticatedRequest, res: Response, next) => {
   try {
     const tenantId = req.auth!.tenantId;
-    const filter: any = { $or: [{ id: req.params.id }, { consignmentNo: req.params.id }, { lrNo: req.params.id }] };
-    if (req.auth?.role !== 'SUPER_ADMIN') filter.tenantId = tenantId;
+    const filter: any = {
+      tenantId,
+      $or: [{ id: req.params.id }, { consignmentNo: req.params.id }, { lrNo: req.params.id }],
+    };
 
     const consignment: any = await ConsignmentModel.findOne(filter).lean();
     if (!consignment) return next(new Error('Consignment not found'));
@@ -139,11 +143,11 @@ consignmentsRouter.get('/:id', requirePermission('read', 'consignments'), async 
     }
 
     const [consignor, consignee, items, history, documents] = await Promise.all([
-      ConsignorModel.findOne({ id: consignment.consignorId }).lean(),
-      ConsigneeModel.findOne({ id: consignment.consigneeId }).lean(),
-      ConsignmentItemModel.find({ consignmentId: consignment.id }).lean(),
-      ConsignmentStatusHistoryModel.find({ consignmentId: consignment.id }).sort({ timestamp: 1 }).lean(),
-      ConsignmentDocumentModel.find({ consignmentId: consignment.id }).lean(),
+      ConsignorModel.findOne({ id: consignment.consignorId, tenantId }).lean(),
+      ConsigneeModel.findOne({ id: consignment.consigneeId, tenantId }).lean(),
+      ConsignmentItemModel.find({ consignmentId: consignment.id, tenantId }).lean(),
+      ConsignmentStatusHistoryModel.find({ consignmentId: consignment.id, tenantId }).sort({ timestamp: 1 }).lean(),
+      ConsignmentDocumentModel.find({ consignmentId: consignment.id, tenantId }).lean(),
     ]);
 
     res.json({
@@ -167,6 +171,16 @@ consignmentsRouter.post('/', requirePermission('create', 'consignments'), async 
   try {
     const tenantId = req.auth!.tenantId;
     const body = createConsignmentSchema.parse(req.body);
+    const [consignorExists, consigneeExists] = await Promise.all([
+      ConsignorModel.exists({ id: body.consignorId, tenantId }),
+      ConsigneeModel.exists({ id: body.consigneeId, tenantId }),
+    ]);
+    if (!consignorExists || !consigneeExists) {
+      return res.status(400).json({
+        success: false,
+        message: 'Consignor and consignee must exist in the current tenant',
+      });
+    }
 
     const { consignmentNo, lrNo } = await generateConsignmentNumbers(tenantId);
     const id = `cgn_${uuidv4().slice(0, 8)}`;
@@ -319,26 +333,16 @@ consignmentsRouter.post('/:id/assign-driver', requirePermission('update', 'consi
 consignmentsRouter.post('/:id/status', requirePermission('update', 'consignments'), async (req: AuthenticatedRequest, res: Response, next) => {
   try {
     const tenantId = req.auth!.tenantId;
-    const { status, remarks, location, latitude, longitude } = z.object({
-      status: z.enum([
-        'DRAFT',
-        'BOOKED',
-        'VEHICLE_ASSIGNED',
-        'DRIVER_ASSIGNED',
-        'PICKED_UP',
-        'IN_TRANSIT',
-        'AT_HUB',
-        'OUT_FOR_DELIVERY',
-        'DELIVERED',
-        'POD_RECEIVED',
-        'CLOSED',
-      ]),
+    const { status: rawStatus, remarks, location, latitude, longitude } = z.object({
+      status: z.string().min(1),
       remarks: z.string().optional(),
       location: z.string().optional(),
       latitude: z.number().optional(),
       longitude: z.number().optional(),
     }).parse(req.body);
 
+    const status = canonicalConsignmentStatus(rawStatus);
+    if (!status) return res.status(400).json({ success: false, message: 'Invalid consignment status' });
     const extraUpdates: any = {};
     if (location || (latitude !== undefined && longitude !== undefined)) {
       extraUpdates.currentLocation = {
@@ -425,11 +429,29 @@ consignmentsRouter.post('/:id/items', requirePermission('update', 'consignments'
       declaredValue: z.number().nonnegative().default(0),
     }).parse(req.body);
 
+    const consignment = await ConsignmentModel.exists({ id: req.params.id, tenantId });
+    if (!consignment) return res.status(404).json({ success: false, message: 'Consignment not found' });
+
     const item = await ConsignmentItemModel.create({
       id: `itm_${uuidv4().slice(0, 8)}`,
       consignmentId: req.params.id,
       tenantId,
       ...body,
+    });
+
+    await recordAudit({
+      tenantId,
+      module: 'consignments',
+      resourceId: req.params.id,
+      action: 'ITEM_ADDED',
+      actor: {
+        userId: req.auth!.userId,
+        email: req.auth!.email,
+        name: req.auth!.name,
+        role: req.auth!.role,
+      },
+      details: { itemId: item.id, quantity: item.quantity, declaredValue: item.declaredValue },
+      ipAddress: req.ip,
     });
 
     res.status(201).json({ success: true, data: item });
@@ -444,7 +466,7 @@ consignmentsRouter.get('/:id/history', requirePermission('read', 'consignments')
     const tenantId = req.auth!.tenantId;
     const history = await ConsignmentStatusHistoryModel.find({
       consignmentId: req.params.id,
-      ...(req.auth?.role !== 'SUPER_ADMIN' ? { tenantId } : {}),
+      tenantId,
     }).sort({ timestamp: 1 }).lean();
 
     res.json({ success: true, data: history, total: history.length });

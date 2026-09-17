@@ -5,7 +5,7 @@ import { seedMongoDatabase } from './seeds/mongoSeeder.js';
 
 let isMongoConnected = false;
 let activeMongoUri = '';
-let mongoServerInstance: any = null;
+let mongoServerInstance: import('mongodb-memory-server').MongoMemoryServer | null = null;
 
 // Prevent long buffering timeouts when database is not connected
 mongoose.set('bufferCommands', false);
@@ -33,7 +33,6 @@ export function sanitizeMongoUri(rawUri: string): string {
 }
 
 export async function initDatabase(): Promise<boolean> {
-  // 1. First attempt connecting to user-provided or local MONGODB_URI
   if (env.MONGODB_URI) {
     const targetUri = sanitizeMongoUri(env.MONGODB_URI);
     try {
@@ -43,16 +42,23 @@ export async function initDatabase(): Promise<boolean> {
       isMongoConnected = true;
       activeMongoUri = targetUri;
       logger.info(' Connected to MongoDB at ' + targetUri.replace(/\/\/.*@/, '//***@'));
-      await seedMongoDatabase();
+      if (env.SEED_ON_BOOT) {
+        logger.info('SEED_ON_BOOT enabled; synchronizing seed data');
+        await seedMongoDatabase({ force: false });
+      }
       return true;
     } catch (error) {
-      logger.warn(
-        ` Remote/Local MongoDB connection failed (${(error as Error).message}). Bootstrapping in-process MongoDB engine...`
-      );
+      isMongoConnected = false;
+      if (env.NODE_ENV === 'production') {
+        throw new Error(`MongoDB connection failed: ${(error as Error).message}`, { cause: error });
+      }
+      logger.warn(`MongoDB connection failed (${(error as Error).message}); trying an in-memory development database`);
     }
+  } else if (env.NODE_ENV === 'production') {
+    throw new Error('MONGODB_URI is required in production');
   }
 
-  // 2. Fallback: Automatically start real MongoDB in-process engine via MongoMemoryServer
+  // Development/test convenience only. Production always fails closed above.
   try {
     const { MongoMemoryServer } = await import('mongodb-memory-server');
     mongoServerInstance = await MongoMemoryServer.create();
@@ -61,7 +67,10 @@ export async function initDatabase(): Promise<boolean> {
     isMongoConnected = true;
     activeMongoUri = memUri;
     logger.info(' Real MongoDB engine initialized and connected at ' + memUri);
-    await seedMongoDatabase();
+    if (env.SEED_ON_BOOT) {
+      logger.info('SEED_ON_BOOT enabled; synchronizing seed data');
+      await seedMongoDatabase({ force: false });
+    }
     return true;
   } catch (err) {
     logger.error({ err, msg: ' Failed to start MongoDB engine.' });

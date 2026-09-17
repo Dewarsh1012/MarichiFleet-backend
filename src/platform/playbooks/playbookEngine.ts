@@ -1,7 +1,10 @@
 import { eventBus, DomainEvent } from '../events/eventBus.js';
-import { PlaybookRunModel, WhatsAppMessageModel, ConsignmentModel, ConsignorModel, ConsigneeModel, ExceptionModel } from '../../db/models/index.js';
+import { PlaybookRunModel, ConsignmentModel, ConsignorModel, ConsigneeModel, ExceptionModel } from '../../db/models/index.js';
 import { logger } from '../logger.js';
 import { v4 as uuidv4 } from 'uuid';
+import { sendWhatsAppMessage, WhatsAppSendResult } from '../whatsapp/whatsappProvider.js';
+import { persistWhatsAppOutbound } from '../whatsapp/whatsappMessageStore.js';
+import { buildWhatsAppMessage } from '../whatsapp/whatsappTemplates.js';
 
 export interface PlaybookDefinition {
   key: string;
@@ -49,6 +52,28 @@ export const PLAYBOOKS: PlaybookDefinition[] = [
   },
 ];
 
+async function sendPlaybookWhatsApp(input: {
+  tenantId: string;
+  phone: string;
+  content: string;
+  type: string;
+  senderName: string;
+  template?: ReturnType<typeof buildWhatsAppMessage>;
+  mediaUrl?: string;
+}): Promise<WhatsAppSendResult> {
+  const message = input.template ?? { body: input.content };
+  const result = await sendWhatsAppMessage({ to: input.phone, ...message, tenantId: input.tenantId });
+  await persistWhatsAppOutbound({
+    input: { to: input.phone, ...message, tenantId: input.tenantId },
+    result,
+    content: input.content,
+    type: input.type,
+    senderName: input.senderName,
+    mediaUrl: input.mediaUrl,
+  });
+  return result;
+}
+
 export function initPlaybookEngine() {
   logger.info('🤖 Initializing MarichiFleet Playbook Automation Engine...');
 
@@ -59,20 +84,20 @@ export function initPlaybookEngine() {
       const consignor = await ConsignorModel.findOne({ id: consignment.consignorId });
       const actions: string[] = [];
 
-      const phone = consignor?.mobile || '+91 98110 23456';
+      const phone = consignor?.mobile;
+      if (!phone) throw new Error(`Consignor phone unavailable for ${consignment.consignorId}`);
       const msgContent = `📦 MarichiFleet Update: Consignment ${consignment.consignmentNo} (LR: ${consignment.lrNo}) has been created for ${consignment.commodity} (${consignment.packageCount} ${consignment.packageType}, ${consignment.weight} Tons) from ${consignment.origin} to ${consignment.destination}. Track live: https://marichifleet.com/portal/consignor`;
 
-      await WhatsAppMessageModel.create({
-        id: `msg_pb_${uuidv4().slice(0, 8)}`,
+      const sendResult = await sendPlaybookWhatsApp({
         tenantId: event.tenantId,
-        sender: 'SYSTEM',
-        recipient: phone,
-        senderName: 'MarichiFleet Dispatch Bot',
+        phone,
         content: msgContent,
         type: 'CONSIGNMENT_ALERT',
-        timestamp: new Date(),
+        senderName: 'MarichiFleet Dispatch Bot',
       });
-      actions.push(`Sent WhatsApp alert to Consignor ${phone}`);
+      actions.push(sendResult.ok
+        ? `Sent WhatsApp alert to Consignor ${phone} (${sendResult.provider})`
+        : `WhatsApp alert failed for Consignor ${phone}: ${sendResult.error?.message}`);
 
       await PlaybookRunModel.create({
         id: `run_${uuidv4().slice(0, 8)}`,
@@ -81,7 +106,7 @@ export function initPlaybookEngine() {
         version: 1,
         triggerEvent: event.type,
         entityId: consignment.id,
-        status: 'SUCCESS',
+        status: sendResult.ok ? 'SUCCESS' : 'FAILED',
         actionsTaken: actions,
         executedAt: new Date(),
       });
@@ -102,35 +127,39 @@ export function initPlaybookEngine() {
 
       const driverInfo = consignment.driverName ? `Driver: ${consignment.driverName} (${consignment.driverPhone || 'On Call'})` : 'Driver assigned';
       const vehicleInfo = `Vehicle: ${consignment.vehicleRegNumber || 'Designated Fleet Vehicle'}`;
+      const sendResults: WhatsAppSendResult[] = [];
 
       // Notify Consignor
       if (consignor?.mobile) {
-        await WhatsAppMessageModel.create({
-          id: `msg_pb_${uuidv4().slice(0, 8)}`,
+        const content = `🚛 Pickup Scheduled: Vehicle assigned for ${consignment.consignmentNo} (LR: ${consignment.lrNo}). ${vehicleInfo}, ${driverInfo}. Estimated departure: ${consignment.shipmentDate}.`;
+        const result = await sendPlaybookWhatsApp({
           tenantId: event.tenantId,
-          sender: 'SYSTEM',
-          recipient: consignor.mobile,
+          phone: consignor.mobile,
           senderName: 'MarichiFleet Operations',
-          content: `🚛 Pickup Scheduled: Vehicle assigned for ${consignment.consignmentNo} (LR: ${consignment.lrNo}). ${vehicleInfo}, ${driverInfo}. Estimated departure: ${consignment.shipmentDate}.`,
+          content,
           type: 'DISPATCH_ALERT',
-          timestamp: new Date(),
         });
-        actions.push(`Notified consignor at ${consignor.mobile}`);
+        sendResults.push(result);
+        actions.push(result.ok ? `Notified consignor at ${consignor.mobile}` : `Consignor notification failed: ${result.error?.message}`);
       }
 
       // Notify Consignee
       if (consignee?.mobile) {
-        await WhatsAppMessageModel.create({
-          id: `msg_pb_${uuidv4().slice(0, 8)}`,
-          tenantId: event.tenantId,
-          sender: 'SYSTEM',
-          recipient: consignee.mobile,
-          senderName: 'MarichiFleet Operations',
-          content: `🚚 Incoming Cargo Notice: Consignment ${consignment.consignmentNo} is dispatched from ${consignment.origin}. Expected delivery by: ${consignment.expectedDeliveryDate}.`,
-          type: 'DISPATCH_ALERT',
-          timestamp: new Date(),
+        const content = `🚚 Incoming Cargo Notice: Consignment ${consignment.consignmentNo} is dispatched from ${consignment.origin}. Expected delivery by: ${consignment.expectedDeliveryDate}.`;
+        const message = buildWhatsAppMessage('eta_update', {
+          reference: consignment.consignmentNo,
+          eta: consignment.expectedDeliveryDate,
         });
-        actions.push(`Notified consignee at ${consignee.mobile}`);
+        const result = await sendPlaybookWhatsApp({
+          tenantId: event.tenantId,
+          phone: consignee.mobile,
+          senderName: 'MarichiFleet Operations',
+          content,
+          type: 'DISPATCH_ALERT',
+          template: message,
+        });
+        sendResults.push(result);
+        actions.push(result.ok ? `Notified consignee at ${consignee.mobile}` : `Consignee notification failed: ${result.error?.message}`);
       }
 
       await PlaybookRunModel.create({
@@ -140,7 +169,7 @@ export function initPlaybookEngine() {
         version: 1,
         triggerEvent: event.type,
         entityId: consignment.id,
-        status: 'SUCCESS',
+        status: sendResults.length > 0 && sendResults.every((result) => result.ok) ? 'SUCCESS' : 'FAILED',
         actionsTaken: actions,
         executedAt: new Date(),
       });
@@ -156,18 +185,20 @@ export function initPlaybookEngine() {
       const consignor = await ConsignorModel.findOne({ id: consignment.consignorId });
       const actions: string[] = [];
 
-      const phone = consignor?.mobile || '+91 98110 23456';
-      await WhatsAppMessageModel.create({
-        id: `msg_pb_${uuidv4().slice(0, 8)}`,
+      const phone = consignor?.mobile;
+      if (!phone) throw new Error(`Consignor phone unavailable for ${consignment.consignorId}`);
+      const content = `✅ Delivered: Consignment ${consignment.consignmentNo} was safely handed over at ${consignment.destination}. Receiver: ${consignment.receiverName || 'Recipient Authorized Signatory'}. Please upload the signed digital POD.`;
+      const sendResult = await sendPlaybookWhatsApp({
         tenantId: event.tenantId,
-        sender: 'SYSTEM',
-        recipient: phone,
+        phone,
         senderName: 'MarichiFleet Proof of Delivery',
-        content: `✅ Delivered: Consignment ${consignment.consignmentNo} was safely handed over at ${consignment.destination}. Receiver: ${consignment.receiverName || 'Recipient Authorized Signatory'}. Digital POD is being indexed.`,
+        content,
         type: 'DELIVERY_ALERT',
-        timestamp: new Date(),
+        template: buildWhatsAppMessage('pod_reminder', { reference: consignment.consignmentNo }),
       });
-      actions.push(`Sent Delivery & POD notice to ${phone}`);
+      actions.push(sendResult.ok
+        ? `Sent Delivery & POD notice to ${phone}`
+        : `Delivery & POD notice failed for ${phone}: ${sendResult.error?.message}`);
 
       await PlaybookRunModel.create({
         id: `run_${uuidv4().slice(0, 8)}`,
@@ -176,7 +207,7 @@ export function initPlaybookEngine() {
         version: 1,
         triggerEvent: event.type,
         entityId: consignment.id,
-        status: 'SUCCESS',
+        status: sendResult.ok ? 'SUCCESS' : 'FAILED',
         actionsTaken: actions,
         executedAt: new Date(),
       });
@@ -191,17 +222,16 @@ export function initPlaybookEngine() {
       const consignment = event.payload;
       const consignee = await ConsigneeModel.findOne({ id: consignment.consigneeId });
       if (consignee?.mobile) {
-        await WhatsAppMessageModel.create({
-          id: `msg_pb_${uuidv4().slice(0, 8)}`,
+        const content = `📄 Verified POD Copy Available: LR ${consignment.lrNo} (Consignment: ${consignment.consignmentNo}). Download copy: ${consignment.podUrl || 'https://marichifleet.com/portal/consignee'}`;
+        const result = await sendPlaybookWhatsApp({
           tenantId: event.tenantId,
-          sender: 'SYSTEM',
-          recipient: consignee.mobile,
+          phone: consignee.mobile,
           senderName: 'MarichiFleet Billing & POD',
-          content: `📄 Verified POD Copy Available: LR ${consignment.lrNo} (Consignment: ${consignment.consignmentNo}). Download copy: ${consignment.podUrl || 'https://marichifleet.com/portal/consignee'}`,
+          content,
           type: 'POD_DOCUMENT',
           mediaUrl: consignment.podUrl,
-          timestamp: new Date(),
         });
+        if (!result.ok) logger.warn({ error: result.error, consignmentId: consignment.id }, 'POD WhatsApp notification failed');
       }
     } catch (err) {
       logger.error({ err }, 'Error in PB-CONSIGNMENT-POD-UPLOADED');

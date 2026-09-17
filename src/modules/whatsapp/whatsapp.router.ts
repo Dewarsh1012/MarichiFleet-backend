@@ -1,17 +1,26 @@
-import { Router, Response } from 'express';
+import express, { Router, Response } from 'express';
 import { z } from 'zod';
 import { AuthenticatedRequest } from '../../platform/types.js';
 import { requirePermission } from '../../platform/middleware/authz.js';
 import { WhatsAppMessageModel, VehicleModel, ExceptionModel, DriverModel } from '../../db/models/index.js';
 import { sendWhatsAppMessage } from '../../platform/whatsapp/whatsappProvider.js';
+import { buildWhatsAppMessage } from '../../platform/whatsapp/whatsappTemplates.js';
+import { parseWhatsAppWebhook, verifyMetaWebhookSignature } from '../../platform/whatsapp/whatsappWebhook.js';
+import {
+  applyWhatsAppStatus,
+  persistWhatsAppInbound,
+  persistWhatsAppOutbound,
+} from '../../platform/whatsapp/whatsappMessageStore.js';
+import { logger } from '../../platform/logger.js';
 import { v4 as uuidv4 } from 'uuid';
 
-export const whatsappRouter = Router();
-
-whatsappRouter.use(requirePermission('read', 'whatsapp'));
+export const whatsappPublicRouter = Router();
+export const whatsappProtectedRouter = Router();
+/** Backwards-compatible protected router export. Webhooks must use whatsappPublicRouter. */
+export const whatsappRouter = whatsappProtectedRouter;
 
 // Get conversation messages
-whatsappRouter.get('/messages', async (req: AuthenticatedRequest, res: Response, next) => {
+whatsappProtectedRouter.get('/messages', requirePermission('read', 'whatsapp'), async (req: AuthenticatedRequest, res: Response, next) => {
   try {
     const tenantId = req.auth!.tenantId;
     const filter: any = { tenantId };
@@ -24,72 +33,115 @@ whatsappRouter.get('/messages', async (req: AuthenticatedRequest, res: Response,
   } catch (err) { next(err); }
 });
 
-// Send message (Meta Cloud API when configured, otherwise simulated + persisted)
-whatsappRouter.post('/send', async (req: AuthenticatedRequest, res: Response, next) => {
+// Send through Meta (or explicit non-production simulation) and persist the attempt.
+whatsappProtectedRouter.post('/send', requirePermission('create', 'whatsapp'), async (req: AuthenticatedRequest, res: Response, next) => {
   try {
     const tenantId = req.auth!.tenantId;
     const body = z.object({
       phone: z.string().min(8),
-      content: z.string().min(1),
+      content: z.string().min(1).optional(),
+      messageKind: z.enum(['driver_offer', 'eta_update', 'pod_reminder', 'approval']).optional(),
+      templateData: z.object({
+        driverName: z.string().optional(),
+        reference: z.string(),
+        origin: z.string().optional(),
+        destination: z.string().optional(),
+        eta: z.string().optional(),
+        amount: z.string().optional(),
+        decision: z.enum(['APPROVED', 'REJECTED']).optional(),
+        reason: z.string().optional(),
+      }).optional(),
       senderName: z.string().optional(),
       mediaUrl: z.string().optional(),
       tripId: z.string().optional(),
       purpose: z.string().optional(),
+    }).superRefine((value, ctx) => {
+      if (!value.content && !(value.messageKind && value.templateData)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'content or messageKind with templateData is required' });
+      }
     }).parse(req.body);
+
+    const message = body.messageKind && body.templateData
+      ? buildWhatsAppMessage(body.messageKind, body.templateData)
+      : { body: body.content! };
+    const displayContent = message.body ?? body.content ?? `${body.messageKind} template`;
 
     const sendResult = await sendWhatsAppMessage({
       to: body.phone,
-      body: body.content,
+      ...message,
       tenantId,
     });
 
-    const newMsg = await WhatsAppMessageModel.create({
-      id: `msg_${uuidv4().slice(0, 8)}`,
-      tenantId,
-      sender: 'SYSTEM',
-      senderPhone: body.phone,
-      senderName: req.auth!.name,
-      recipient: body.phone,
-      content: body.content,
-      type: body.purpose ?? 'OUTBOUND',
+    const sent = await persistWhatsAppOutbound({
+      input: { to: body.phone, ...message, tenantId },
+      result: sendResult,
+      content: displayContent,
+      type: body.purpose ?? body.messageKind ?? 'OUTBOUND',
+      senderName: body.senderName ?? req.auth!.name,
       mediaUrl: body.mediaUrl,
       tripId: body.tripId,
-      deliveryStatus: sendResult.ok ? 'sent' : 'failed',
-      provider: sendResult.provider,
-      externalId: sendResult.messageId,
-      timestamp: new Date(),
     });
 
-    res.json({
-      success: true,
+    res.status(sendResult.ok ? 200 : 502).json({
+      success: sendResult.ok,
       data: {
-        sent: newMsg,
-        provider: sendResult.provider,
-        externalId: sendResult.messageId,
+        sent,
+        result: sendResult,
         simulated: sendResult.provider === 'simulated',
       },
     });
   } catch (err) { next(err); }
 });
 
-// Inbound webhook stub (Meta Cloud API verification + receive)
-whatsappRouter.get('/webhook', async (req, res) => {
+// These handlers are intentionally isolated from the protected router.
+whatsappPublicRouter.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-  if (mode === 'subscribe' && token === process.env.WHATSAPP_VERIFY_TOKEN) {
+  const verifyToken = process.env.WHATSAPP_VERIFY_TOKEN;
+  if (verifyToken && mode === 'subscribe' && token === verifyToken && typeof challenge === 'string') {
     return res.status(200).send(challenge);
   }
   return res.sendStatus(403);
 });
 
-whatsappRouter.post('/webhook', async (req: AuthenticatedRequest, res: Response) => {
-  res.sendStatus(200);
-  // Async processing would enqueue here; for now acknowledge immediately per Meta requirements
+whatsappPublicRouter.post('/webhook', express.raw({ type: 'application/json', limit: '2mb' }), async (req, res) => {
+  const rawBody = Buffer.isBuffer(req.body) ? req.body : undefined;
+  if (!rawBody) {
+    return res.status(400).json({
+      success: false,
+      error: 'Raw request body unavailable. Mount whatsappPublicRouter before express.json().',
+    });
+  }
+  const appSecret = process.env.WHATSAPP_APP_SECRET ?? '';
+  const signature = req.get('x-hub-signature-256');
+  if (!verifyMetaWebhookSignature(rawBody, signature, appSecret)) {
+    return res.status(401).json({ success: false, error: 'Invalid Meta webhook signature.' });
+  }
+
+  try {
+    const parsed = parseWhatsAppWebhook(JSON.parse(rawBody.toString('utf8')));
+    const tenantId = resolveWebhookTenant(parsed.phoneNumberId);
+    if (!tenantId) {
+      logger.error({ phoneNumberId: parsed.phoneNumberId }, 'No tenant mapping for WhatsApp webhook');
+      return res.status(503).json({ success: false, error: 'No tenant mapping for WhatsApp phone number.' });
+    }
+    let inserted = 0;
+    for (const message of parsed.messages) {
+      if (await persistWhatsAppInbound(tenantId, parsed.displayPhoneNumber ?? parsed.phoneNumberId ?? '', message)) inserted += 1;
+    }
+    for (const status of parsed.statuses) {
+      await applyWhatsAppStatus(tenantId, status);
+    }
+    return res.status(200).json({ success: true, received: parsed.messages.length, inserted, statuses: parsed.statuses.length });
+  } catch (error) {
+    logger.error({ error }, 'Failed to process WhatsApp webhook');
+    return res.status(500).json({ success: false, error: 'Webhook processing failed.' });
+  }
 });
 
-// Update live location from WhatsApp share
-whatsappRouter.post('/live-location', async (req: AuthenticatedRequest, res: Response, next) => {
+// Update live location from an authenticated internal request.
+whatsappProtectedRouter.post('/live-location', requirePermission('update', 'whatsapp'), async (req: AuthenticatedRequest, res: Response, next) => {
   try {
     const tenantId = req.auth!.tenantId;
     const { vehicleRegNumber, driverPhone, latitude, longitude, speedKmH } = req.body;
@@ -121,7 +173,7 @@ whatsappRouter.post('/live-location', async (req: AuthenticatedRequest, res: Res
 });
 
 // Location drop alert workflow
-whatsappRouter.post('/location-drop', async (req: AuthenticatedRequest, res: Response, next) => {
+whatsappProtectedRouter.post('/location-drop', requirePermission('create', 'whatsapp'), async (req: AuthenticatedRequest, res: Response, next) => {
   try {
     const tenantId = req.auth!.tenantId;
     const { vehicleRegNumber, driverPhone } = req.body;
@@ -136,16 +188,11 @@ whatsappRouter.post('/location-drop', async (req: AuthenticatedRequest, res: Res
     const alertText = `ALERT: Live Location signal drop for ${vehicleRegNumber}. Please open WhatsApp and share Live Location (8 hours) again.`;
     const sendResult = await sendWhatsAppMessage({ to: phone, body: alertText, tenantId });
 
-    await WhatsAppMessageModel.create({
-      id: `msg_${uuidv4().slice(0, 8)}`,
-      tenantId,
-      sender: 'SYSTEM',
-      recipient: phone,
+    await persistWhatsAppOutbound({
+      input: { to: phone, body: alertText, tenantId },
+      result: sendResult,
       content: alertText,
       type: 'LOCATION_DROP_ALERT',
-      deliveryStatus: sendResult.ok ? 'sent' : 'failed',
-      provider: sendResult.provider,
-      timestamp: new Date(),
     });
 
     await ExceptionModel.create({
@@ -159,6 +206,22 @@ whatsappRouter.post('/location-drop', async (req: AuthenticatedRequest, res: Res
       timestamp: new Date(),
     });
 
-    res.json({ success: true, message: 'Location drop alert sent.', provider: sendResult.provider });
+    res.status(sendResult.ok ? 200 : 502).json({
+      success: sendResult.ok,
+      message: sendResult.ok ? 'Location drop alert sent.' : 'Location drop alert was not sent.',
+      result: sendResult,
+    });
   } catch (err) { next(err); }
 });
+
+export function resolveWebhookTenant(phoneNumberId: string | undefined): string | undefined {
+  if (phoneNumberId && process.env.WHATSAPP_PHONE_NUMBER_TENANT_MAP) {
+    try {
+      const mapping = JSON.parse(process.env.WHATSAPP_PHONE_NUMBER_TENANT_MAP) as Record<string, string>;
+      if (mapping[phoneNumberId]) return mapping[phoneNumberId];
+    } catch {
+      logger.error('WHATSAPP_PHONE_NUMBER_TENANT_MAP is not valid JSON');
+    }
+  }
+  return process.env.WHATSAPP_TENANT_ID;
+}
